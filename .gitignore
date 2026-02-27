@@ -1,0 +1,30 @@
+# Binary output
+icap-logger
+*.exe
+*.out
+
+# Go build cache
+*.o
+*.a
+*.so
+
+# Go module cache
+vendor/
+
+# Test output
+*.test
+*.prof
+coverage.out
+
+# Log files
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo

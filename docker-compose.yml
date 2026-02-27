@@ -1,0 +1,37 @@
+services:
+  icap-logger:
+    image: icap-logger:1.0.0
+    container_name: icap-logger
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "11344:11344"
+      - "8080:8080"
+    volumes:
+      - ./logs:/var/log
+    environment:
+      - ICAP_PORT=11344
+      - LOG_FILE=/var/log/icap_bodies.log
+      - LOG_ROTATE_SIZE_MB=25
+      - MAX_BODY_SIZE=10485760
+      - READ_TIMEOUT_SEC=30
+      - WRITE_TIMEOUT_SEC=10
+      - HEALTH_PORT=8080
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
