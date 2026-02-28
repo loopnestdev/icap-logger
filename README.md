@@ -113,8 +113,14 @@ All settings are configurable via environment variables. CLI flags `--port=` and
 
 ```
 icap-logger/
-├── main.go             # ICAP server — config, graceful shutdown, health endpoint, log rotation
-├── main_test.go        # Unit tests for ICAP parsing
+├── main.go             # Entry point — main(), signal handling, server bootstrap
+├── config.go           # Config struct, loadConfig(), getEnv(), getEnvInt()
+├── server.go           # handleConn() — reads, parses, logs, responds
+├── parser.go           # parseICAP(), splitEncapsulated(), headersToMap()
+├── logger.go           # rotatingWriter — size-based log rotation (stdlib only)
+├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked()
+├── types.go            # Config, icapInfo, logEntry struct definitions
+├── main_test.go        # Unit tests for ICAP parsing (13 tests)
 ├── go.mod              # Go module (no external dependencies)
 ├── Dockerfile          # Multi-stage hardened Alpine build
 ├── docker-compose.yml  # Full production Compose config
