@@ -8,17 +8,31 @@ RUN go mod download
 
 # Copy source and build a fully static, stripped binary
 COPY *.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o icap-logger .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o icap-logger .
 
-FROM alpine:3.20
+FROM --platform=linux/amd64 alpine:3.23
 WORKDIR /app
 
 # Install wget for health checks; create non-root user and log directory
-RUN apk add --no-cache wget && \
+RUN apk update --no-check-certificate && \
+    apk upgrade --no-check-certificate && \
+    apk add --no-cache --no-check-certificate \
+      bind-tools \
+      ca-certificates \
+      curl \
+      jq \
+      nss-tools \
+      logrotate \
+      tzdata \
+      wget && \
+    rm -rf /var/cache/apk/* /tmp/* && \
+    update-ca-certificates && \
+    cp -R /usr/share/zoneinfo/Australia/ACT /etc/localtime && \
+    echo "Australia/ACT" > /etc/timezone && \
     addgroup -S icap && \
     adduser -S -G icap icap && \
-    mkdir -p /var/log && \
-    chown icap:icap /var/log
+    mkdir -p /var/log/icap && \
+    chown icap:icap /var/log/icap
 
 COPY --from=builder /app/icap-logger .
 

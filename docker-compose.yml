@@ -9,10 +9,10 @@ services:
       - "11344:11344"
       - "8080:8080"
     volumes:
-      - ./logs:/var/log
+      - ./logs:/var/log/icap
     environment:
       - ICAP_PORT=11344
-      - LOG_FILE=/var/log/icap_bodies.log
+      - LOG_FILE=/var/log/icap/icap_logger.log
       - LOG_ROTATE_SIZE_MB=25
       - MAX_BODY_SIZE=10485760
       - READ_TIMEOUT_SEC=30

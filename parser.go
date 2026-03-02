@@ -26,8 +26,9 @@ func parseICAP(raw []byte) icapInfo {
 		info.icapURL = parts[1]
 	}
 
-	// Parse ICAP headers
+	// Parse ICAP headers until blank line
 	info.icapHeaders = make(http.Header)
+	encapsulatedHeader := ""
 	for {
 		line, err := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
@@ -38,28 +39,35 @@ func parseICAP(raw []byte) icapInfo {
 			key := strings.TrimSpace(line[:idx])
 			val := strings.TrimSpace(line[idx+1:])
 			info.icapHeaders.Add(key, val)
+			// Capture the Encapsulated header for offset-based splitting
+			if strings.EqualFold(key, "Encapsulated") {
+				encapsulatedHeader = val
+			}
 		}
 	}
 
-	// The remainder contains encapsulated HTTP request/response headers
+	// The remainder after the ICAP header blank line is the encapsulated HTTP data
 	remaining, _ := io.ReadAll(reader)
-	sections := splitEncapsulated(remaining)
 
-	if reqBytes, ok := sections["req-hdr"]; ok {
+	// Use RFC 3507 offset-based splitting
+	sections := splitEncapsulated(remaining, encapsulatedHeader)
+
+	// --- req-hdr ---
+	if reqBytes, ok := sections["req-hdr"]; ok && len(reqBytes) > 0 {
 		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
 		if err == nil {
 			info.reqMethod = req.Method
 			info.reqHeaders = req.Header
 			if req.URL != nil {
-				info.reqPath = req.URL.Path
-			}
-			scheme := "http"
-			if req.TLS != nil {
-				scheme = "https"
+				info.reqPath = req.URL.RequestURI()
 			}
 			host := req.Host
 			if host == "" {
 				host = req.Header.Get("Host")
+			}
+			scheme := "http"
+			if req.Header.Get("X-Forwarded-Proto") == "https" {
+				scheme = "https"
 			}
 			requestURI := ""
 			if req.URL != nil {
@@ -71,7 +79,8 @@ func parseICAP(raw []byte) icapInfo {
 		}
 	}
 
-	if respBytes, ok := sections["res-hdr"]; ok {
+	// --- res-hdr ---
+	if respBytes, ok := sections["res-hdr"]; ok && len(respBytes) > 0 {
 		resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(respBytes)), nil)
 		if err == nil {
 			info.respStatus = resp.Status
@@ -83,57 +92,88 @@ func parseICAP(raw []byte) icapInfo {
 		}
 	}
 
-	if bodyBytes, ok := sections["req-body"]; ok {
+	// --- req-body ---
+	if bodyBytes, ok := sections["req-body"]; ok && len(bodyBytes) > 0 {
 		decoded := decodeChunked(bodyBytes)
-		info.reqBody = sanitizeBody(decoded, info.reqHeaders.Get("Content-Type"))
+		ct := ""
+		if info.reqHeaders != nil {
+			ct = info.reqHeaders.Get("Content-Type")
+		}
+		info.reqBody = sanitizeBody(decoded, ct)
 	}
-	if bodyBytes, ok := sections["res-body"]; ok {
+
+	// --- res-body ---
+	if bodyBytes, ok := sections["res-body"]; ok && len(bodyBytes) > 0 {
 		decoded := decodeChunked(bodyBytes)
-		info.respBody = sanitizeBody(decoded, info.respHeaders.Get("Content-Type"))
+		ct := ""
+		if info.respHeaders != nil {
+			ct = info.respHeaders.Get("Content-Type")
+		}
+		info.respBody = sanitizeBody(decoded, ct)
 	}
 
 	return info
 }
 
-// splitEncapsulated splits the encapsulated body of an ICAP message into named
-// sections (req-hdr, res-hdr, req-body, res-body) using a heuristic based on
-// blank-line-separated HTTP messages.
-func splitEncapsulated(data []byte) map[string][]byte {
+// splitEncapsulated parses the Encapsulated header value and uses byte offsets
+// to slice the data buffer into named sections per RFC 3507 §4.4.1.
+//
+// Examples:
+//
+//	"req-hdr=0, null-body=106"             → req-hdr[0:106]
+//	"req-hdr=0, req-body=47"               → req-hdr[0:47], req-body[47:end]
+//	"res-hdr=0, res-body=38"               → res-hdr[0:38], res-body[38:end]
+//	"req-hdr=0, res-hdr=210, res-body=294" → three sections
+func splitEncapsulated(data []byte, encHeader string) map[string][]byte {
 	sections := make(map[string][]byte)
-	if len(data) == 0 {
+	if encHeader == "" || len(data) == 0 {
 		return sections
 	}
 
-	parts := bytes.SplitN(data, []byte("\r\n\r\n"), 3)
+	type part struct {
+		name   string
+		offset int
+	}
 
-	for i, part := range parts {
-		if len(part) == 0 {
+	var parts []part
+	for _, token := range strings.Split(encHeader, ",") {
+		token = strings.TrimSpace(token)
+		kv := strings.SplitN(token, "=", 2)
+		if len(kv) != 2 {
 			continue
 		}
-		firstLine := strings.SplitN(string(part), "\r\n", 2)[0]
-		firstLineUpper := strings.ToUpper(firstLine)
-		partCopy := make([]byte, len(part))
-		copy(partCopy, part)
-		block := append(partCopy, []byte("\r\n\r\n")...)
-		switch {
-		case strings.HasPrefix(firstLineUpper, "HTTP/"):
-			sections["res-hdr"] = block
-		case isChunkedBody(part):
-			if _, exists := sections["req-body"]; !exists && sections["req-hdr"] != nil {
-				sections["req-body"] = part
-			} else if _, exists := sections["res-body"]; !exists {
-				sections["res-body"] = part
-			}
-		case i == 0 || strings.ContainsAny(firstLineUpper[:minInt(4, len(firstLineUpper))], "ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
-			if _, exists := sections["req-hdr"]; !exists {
-				sections["req-hdr"] = block
-			}
+		name := strings.TrimSpace(strings.ToLower(kv[0]))
+		// null-body is a marker only — no bytes to slice
+		if name == "null-body" {
+			continue
 		}
+		offset := 0
+		fmt.Sscanf(strings.TrimSpace(kv[1]), "%d", &offset)
+		parts = append(parts, part{name, offset})
 	}
+
+	for i, p := range parts {
+		start := p.offset
+		end := len(data)
+		if i+1 < len(parts) {
+			end = parts[i+1].offset
+		}
+		if start >= len(data) {
+			continue
+		}
+		if end > len(data) {
+			end = len(data)
+		}
+		buf := make([]byte, end-start)
+		copy(buf, data[start:end])
+		sections[p.name] = buf
+	}
+
 	return sections
 }
 
-// headersToMap converts http.Header to a flat map[string]string joining multiple values with ", ".
+// headersToMap converts http.Header to a flat map[string]string,
+// joining multiple values with ", ".
 func headersToMap(h http.Header) map[string]string {
 	m := make(map[string]string, len(h))
 	for k, vs := range h {
