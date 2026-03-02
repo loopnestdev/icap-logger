@@ -197,22 +197,43 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 
 	info := parseICAP(buf)
 
+	// A CONNECT request establishes an opaque TLS tunnel — Squid forwards
+	// only the CONNECT line to ICAP (null-body), so no request body is ever
+	// available regardless of what the client sends through the tunnel.
+	tunneled := info.reqMethod == "CONNECT"
+
+	reqBody := info.reqBody
+	if tunneled && reqBody == "" {
+		reqBody = "[tunneled: HTTPS traffic, body not inspectable]"
+	}
+
+	// "2006-01-02T15:04:05.000Z07:00" is RFC3339 with exactly 3ms digits.
+	const tsFormat = "2006-01-02T15:04:05.000Z07:00"
+
 	entry := logEntry{
-		// Issue 2 fix: use time.Now() without .UTC() so the container's
-		// local timezone (set via TZ env var / /etc/localtime) is respected.
-		Timestamp:      time.Now().Format(time.RFC3339),
+		Timestamp:      time.Now().Format(tsFormat),
 		ICAPMethod:     info.icapMethod,
 		ICAPURL:        info.icapURL,
 		ReqMethod:      info.reqMethod,
 		ReqPath:        info.reqPath,
 		DestinationURL: info.destinationURL,
-		ReqBody:        info.reqBody,
+		Tunneled:       tunneled,
+		ReqBody:        reqBody,
 		RespStatus:     info.respStatus,
 		RespBody:       info.respBody,
 	}
 
 	if len(info.icapHeaders) > 0 {
 		entry.ICAPHeaders = headersToMap(info.icapHeaders)
+		// Squid sets Date in RFC 1123 / GMT. Reformat to local timezone so
+		// all timestamps in the log entry are consistent.
+		if dateStr, ok := entry.ICAPHeaders["Date"]; ok {
+			// RFC 1123 carries no sub-second precision; parse it and reformat
+			// with milliseconds using the same tsFormat as the timestamp field.
+			if t, err := time.Parse(time.RFC1123, dateStr); err == nil {
+				entry.ICAPHeaders["Date"] = t.Local().Format(tsFormat)
+			}
+		}
 	}
 	if len(info.reqHeaders) > 0 {
 		entry.ReqHeaders = headersToMap(info.reqHeaders)

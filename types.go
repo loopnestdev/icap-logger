@@ -41,6 +41,7 @@ type logEntry struct {
 	ReqMethod      string            `json:"req_method,omitempty"`
 	ReqPath        string            `json:"req_path,omitempty"`
 	DestinationURL string            `json:"destination_url,omitempty"`
+	Tunneled       bool              `json:"tunneled,omitempty"`
 	ReqHeaders     map[string]string `json:"req_headers,omitempty"`
 	ReqBody        string            `json:"req_body,omitempty"`
 	RespStatus     string            `json:"resp_status,omitempty"`
