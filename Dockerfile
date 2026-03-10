@@ -10,7 +10,7 @@ RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o icap-logger .
 
-FROM --platform=linux/amd64 alpine:3.23
+FROM alpine:3.23
 WORKDIR /app
 
 # Install wget for health checks; create non-root user and log directory
