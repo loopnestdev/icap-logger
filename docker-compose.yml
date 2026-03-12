@@ -14,10 +14,15 @@ services:
       - ICAP_PORT=11344
       - LOG_FILE=/var/log/icap/icap_logger.log
       - LOG_ROTATE_SIZE_MB=25
-      - MAX_BODY_SIZE=10485760
+      # Max number of compressed (.gz) archive files to keep. Oldest are deleted
+      # automatically when the count exceeds this value. Default: 60.
+      - LOG_FILE_RETENTION=60
+      - MAX_BODY_SIZE=26214400
       - READ_TIMEOUT_SEC=30
       - WRITE_TIMEOUT_SEC=10
       - HEALTH_PORT=8080
+      # Set to false to log Authorization headers (e.g. during debug sessions)
+      - REDACT_AUTH_HEADER=true
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
       interval: 30s

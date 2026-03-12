@@ -1,9 +1,20 @@
 package main
 
 import (
+	"compress/gzip"
+	"encoding/base64"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// itoa is a test helper for int-to-string conversion.
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // buildICAP is a test helper that assembles a raw ICAP byte slice from parts.
 func buildICAP(requestLine, icapHeaders, encapsulated string) []byte {
@@ -280,17 +291,379 @@ func TestIsBinary_BinaryData(t *testing.T) {
 	}
 }
 
-// ── helper ────────────────────────────────────────────────────────────────────
+// ── looksLikeBase64 unit tests ────────────────────────────────────────────────
 
-// itoa converts an int to its decimal string — avoids importing strconv in tests.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+func TestLooksLikeBase64_ShortString(t *testing.T) {
+	if looksLikeBase64("abc") {
+		t.Error("short string should not be flagged as base64")
 	}
-	buf := make([]byte, 0, 10)
-	for n > 0 {
-		buf = append([]byte{byte('0' + n%10)}, buf...)
-		n /= 10
+}
+
+func TestLooksLikeBase64_RegularText(t *testing.T) {
+	// Regular JSON text with spaces/punctuation — NOT base64
+	s := strings.Repeat("hello world this is plain text. ", 20)
+	if looksLikeBase64(s) {
+		t.Error("plain text should not be flagged as base64")
 	}
-	return string(buf)
+}
+
+func TestLooksLikeBase64_ActualBase64(t *testing.T) {
+	// Encode a realistic multipart body (same pattern as production 'raw' field)
+	// This produces a "LS1Z..." prefix because the content starts with "--YYYY".
+	payload := "--YYYY\r\nContent-Disposition: form-data; name=\"files[]\"; filename=\"3MB Text.txt\"\r\nContent-Type: text/plain\r\n\r\n" +
+		strings.Repeat("examplefile.com | Your Example Files.\r\n", 100)
+	encoded := base64Encode([]byte(payload))
+	if !looksLikeBase64(encoded) {
+		t.Error("standard base64-encoded payload should be detected")
+	}
+}
+
+func TestLooksLikeBase64_URLSafe(t *testing.T) {
+	// URL-safe Base64 uses '-' and '_' instead of '+' and '/'.
+	// Used by JWT, many REST APIs, and some file upload services.
+	payload := strings.Repeat("binary\x00\xff\xfe data for url-safe test\n", 50)
+	encoded := base64.URLEncoding.EncodeToString([]byte(payload))
+	if !looksLikeBase64(encoded) {
+		t.Error("URL-safe base64 payload should be detected")
+	}
+}
+
+func TestLooksLikeBase64_MIMEWrapped(t *testing.T) {
+	// MIME-wrapped Base64 inserts \r\n every 76 chars.
+	// Used by Java Base64.getMimeEncoder(), email attachments, some PDF encoders.
+	payload := strings.Repeat("mime encoded file content for testing purposes\n", 50)
+	encoded := base64.StdEncoding.EncodeToString([]byte(payload))
+	// Simulate MIME line-wrapping at 76 chars
+	var wrapped strings.Builder
+	for i := 0; i < len(encoded); i += 76 {
+		end := i + 76
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		wrapped.WriteString(encoded[i:end])
+		wrapped.WriteString("\r\n")
+	}
+	if !looksLikeBase64(wrapped.String()) {
+		t.Error("MIME-wrapped base64 payload should be detected")
+	}
+}
+
+func TestLooksLikeBase64_PNGPrefix(t *testing.T) {
+	// PNG magic bytes: 0x89 0x50 0x4E 0x47 → Base64 prefix "iVBO"
+	pngMagic := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+	payload := append(pngMagic, []byte(strings.Repeat("fake png body data\n", 40))...)
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	if !looksLikeBase64(encoded) {
+		t.Error("Base64-encoded PNG payload should be detected (prefix: iVBO)")
+	}
+}
+
+func TestLooksLikeBase64_ZIPPrefix(t *testing.T) {
+	// ZIP magic bytes: 0x50 0x4B 0x03 0x04 → Base64 prefix "UEsD"
+	zipMagic := []byte{0x50, 0x4B, 0x03, 0x04}
+	payload := append(zipMagic, []byte(strings.Repeat("fake zip body data\n", 40))...)
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	if !looksLikeBase64(encoded) {
+		t.Error("Base64-encoded ZIP payload should be detected (prefix: UEsD)")
+	}
+}
+
+// ── sanitizeBody JSON redaction tests ─────────────────────────────────────────
+
+func TestSanitizeBody_JSONBase64FieldRedacted(t *testing.T) {
+	// Reproduce the exact production case: PUT with JSON body containing
+	// a 'raw' field that holds a Base64-encoded multipart file attachment.
+	payload := "--YYYY\r\nContent-Disposition: form-data; name=\"files[]\"; filename=\"3MB Text.txt\"\r\nContent-Type: text/plain\r\n\r\n" +
+		strings.Repeat("examplefile.com | Your Example Files.\r\n", 1000)
+	encoded := base64Encode([]byte(payload))
+
+	body := `{"sys_id":"abc123","snow_id":"def456","last_update":1773208633000,"raw":"` + encoded + `"}`
+
+	got := sanitizeBody(body, "application/json")
+
+	if strings.Contains(got, encoded[:50]) {
+		t.Fatalf("Base64 payload must be redacted, got raw base64 in: %.200s", got)
+	}
+	if !strings.Contains(got, "[redacted: base64 payload") {
+		t.Fatalf("expected redaction marker, got: %.200s", got)
+	}
+	// Other fields must be preserved
+	if !strings.Contains(got, "abc123") {
+		t.Fatalf("sys_id field must be preserved, got: %.200s", got)
+	}
+}
+
+func TestSanitizeBody_JSONNonBase64Preserved(t *testing.T) {
+	body := `{"key":"value","number":42,"nested":{"a":"b"}}`
+	got := sanitizeBody(body, "application/json")
+	if !strings.Contains(got, "value") {
+		t.Fatalf("non-base64 JSON fields must be preserved, got: %s", got)
+	}
+}
+
+func TestSanitizeBody_JSONEmptyBody(t *testing.T) {
+	got := sanitizeBody("", "application/json")
+	if got != "" {
+		t.Errorf("empty body should return empty, got %q", got)
+	}
+}
+
+// base64Encode is a test helper (avoids import in main test file).
+func base64Encode(src []byte) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	var sb strings.Builder
+	for i := 0; i < len(src); i += 3 {
+		b0 := src[i]
+		var b1, b2 byte
+		if i+1 < len(src) {
+			b1 = src[i+1]
+		}
+		if i+2 < len(src) {
+			b2 = src[i+2]
+		}
+		sb.WriteByte(alphabet[b0>>2])
+		sb.WriteByte(alphabet[((b0&0x3)<<4)|(b1>>4)])
+		if i+1 < len(src) {
+			sb.WriteByte(alphabet[((b1&0xf)<<2)|(b2>>6)])
+		} else {
+			sb.WriteByte('=')
+		}
+		if i+2 < len(src) {
+			sb.WriteByte(alphabet[b2&0x3f])
+		} else {
+			sb.WriteByte('=')
+		}
+	}
+	return sb.String()
+}
+
+// ── redactAuthHeaders unit tests ──────────────────────────────────────────────
+
+func TestRedactAuthHeaders_Redacts(t *testing.T) {
+	headers := map[string]string{
+		"Authorization":       "Basic dXNlcjpwYXNz",
+		"Proxy-Authorization": "Bearer token123",
+		"Content-Type":        "application/json",
+	}
+	redactAuthHeaders(headers)
+	if headers["Authorization"] != "[redacted]" {
+		t.Errorf("Authorization must be redacted, got %q", headers["Authorization"])
+	}
+	if headers["Proxy-Authorization"] != "[redacted]" {
+		t.Errorf("Proxy-Authorization must be redacted, got %q", headers["Proxy-Authorization"])
+	}
+	if headers["Content-Type"] != "application/json" {
+		t.Errorf("Content-Type must be unchanged, got %q", headers["Content-Type"])
+	}
+}
+
+func TestRedactAuthHeaders_EmptyMap(t *testing.T) {
+	headers := map[string]string{}
+	redactAuthHeaders(headers) // must not panic
+}
+
+func TestGetEnvBool_Defaults(t *testing.T) {
+	t.Setenv("REDACT_AUTH_HEADER", "")
+	if !getEnvBool("REDACT_AUTH_HEADER", true) {
+		t.Error("empty env var should return fallback true")
+	}
+}
+
+func TestGetEnvBool_False(t *testing.T) {
+	t.Setenv("REDACT_AUTH_HEADER", "false")
+	if getEnvBool("REDACT_AUTH_HEADER", true) {
+		t.Error("env var=false should return false")
+	}
+}
+
+func TestGetEnvBool_True(t *testing.T) {
+	t.Setenv("REDACT_AUTH_HEADER", "1")
+	if !getEnvBool("REDACT_AUTH_HEADER", false) {
+		t.Error("env var=1 should return true")
+	}
+}
+
+// ── rotatingWriter unit tests ─────────────────────────────────────────────────
+
+// TestRotatingWriter_RotatesOnSizeThreshold verifies that once the size threshold
+// is crossed a new active file is created and the rotated file exists.
+func TestRotatingWriter_RotatesOnSizeThreshold(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "test.log")
+
+	// 1-byte threshold so any write forces rotation.
+	w, err := newRotatingWriter(logFile, 0 /* 0 MB = 0 bytes max */, 60)
+	if err != nil {
+		t.Fatalf("newRotatingWriter: %v", err)
+	}
+	defer w.Close()
+
+	// Force size > 0 so the threshold check fires.
+	w.mu.Lock()
+	w.maxSize = 10 // 10 bytes
+	w.mu.Unlock()
+
+	// Write enough to trigger rotation.
+	payload := []byte("hello world!") // 12 bytes > 10
+	if _, err := w.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Give the background goroutine time to rename + compress.
+	time.Sleep(300 * time.Millisecond)
+
+	// Active log file must exist.
+	if _, err := os.Stat(logFile); err != nil {
+		t.Errorf("active log file missing after rotation: %v", err)
+	}
+
+	// At least one .gz archive must exist.
+	entries, _ := os.ReadDir(dir)
+	var gzFiles []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") {
+			gzFiles = append(gzFiles, e.Name())
+		}
+	}
+	if len(gzFiles) == 0 {
+		t.Error("expected at least one .gz archive after rotation")
+	}
+}
+
+// TestRotatingWriter_PrunesOldArchives verifies that archives beyond the
+// fileRetention limit are removed oldest-first.
+func TestRotatingWriter_PrunesOldArchives(t *testing.T) {
+	dir := t.TempDir()
+	baseName := filepath.Join(dir, "icap_logger.log")
+
+	// Create 5 fake .gz archives with distinct timestamps (oldest first).
+	timestamps := []string{
+		"20260101-000000",
+		"20260102-000000",
+		"20260103-000000",
+		"20260104-000000",
+		"20260105-000000",
+	}
+	for _, ts := range timestamps {
+		path := baseName + "." + ts + ".gz"
+		if err := os.WriteFile(path, []byte("fake gz content"), 0644); err != nil {
+			t.Fatalf("WriteFile %s: %v", path, err)
+		}
+	}
+
+	// Prune to max 3 — the 2 oldest must be removed.
+	pruneOldArchives(baseName, 3)
+
+	entries, _ := os.ReadDir(dir)
+	var remaining []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") {
+			remaining = append(remaining, e.Name())
+		}
+	}
+
+	if len(remaining) != 3 {
+		t.Errorf("expected 3 archives after pruning, got %d: %v", len(remaining), remaining)
+	}
+
+	// The 3 newest must survive.
+	sort.Strings(remaining)
+	wantSuffixes := []string{"20260103-000000.gz", "20260104-000000.gz", "20260105-000000.gz"}
+	for i, want := range wantSuffixes {
+		if !strings.HasSuffix(remaining[i], want) {
+			t.Errorf("archive[%d]: want suffix %q, got %q", i, want, remaining[i])
+		}
+	}
+}
+
+// TestCompressFile_RoundTrip verifies that compressFile produces a valid gzip
+// archive that decompresses to the original content.
+func TestCompressFile_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "input.log")
+	dst := filepath.Join(dir, "input.log.gz")
+
+	want := strings.Repeat("icap log line\n", 100)
+	if err := os.WriteFile(src, []byte(want), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := compressFile(src, dst); err != nil {
+		t.Fatalf("compressFile: %v", err)
+	}
+
+	// Open and decompress.
+	f, err := os.Open(dst)
+	if err != nil {
+		t.Fatalf("open gz: %v", err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gr.Close()
+
+	got, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("ReadAll gz: %v", err)
+	}
+
+	if string(got) != want {
+		t.Errorf("round-trip mismatch: got %d bytes, want %d bytes", len(got), len(want))
+	}
+}
+
+// TestPruneOldArchives_WithinLimit verifies that no files are deleted when the
+// archive count is at or below the limit.
+func TestPruneOldArchives_WithinLimit(t *testing.T) {
+	dir := t.TempDir()
+	baseName := filepath.Join(dir, "icap_logger.log")
+
+	for _, ts := range []string{"20260101-000000", "20260102-000000"} {
+		path := baseName + "." + ts + ".gz"
+		if err := os.WriteFile(path, []byte("gz"), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	pruneOldArchives(baseName, 5) // limit=5, only 2 exist — nothing deleted
+
+	entries, _ := os.ReadDir(dir)
+	count := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected 2 archives (within limit), got %d", count)
+	}
+}
+
+// TestPruneOldArchives_Unlimited verifies that fileRetention=0 never prunes.
+func TestPruneOldArchives_Unlimited(t *testing.T) {
+	dir := t.TempDir()
+	baseName := filepath.Join(dir, "icap_logger.log")
+
+	for _, ts := range []string{"20260101-000000", "20260102-000000", "20260103-000000"} {
+		path := baseName + "." + ts + ".gz"
+		if err := os.WriteFile(path, []byte("gz"), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	pruneOldArchives(baseName, 0) // 0 = unlimited
+
+	entries, _ := os.ReadDir(dir)
+	count := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Errorf("expected all 3 archives to survive with fileRetention=0, got %d", count)
+	}
 }

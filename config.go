@@ -11,13 +11,15 @@ import (
 // CLI flags --port=, --log=, and --log-rotate-size= take precedence over env vars.
 func loadConfig() Config {
 	cfg := Config{
-		Port:            getEnv("ICAP_PORT", "11344"),
-		LogFile:         getEnv("LOG_FILE", "/var/log/icap/icap_logger.log"),
-		LogRotateSizeMB: int64(getEnvInt("LOG_ROTATE_SIZE_MB", 25)),
-		MaxBodySize:     int64(getEnvInt("MAX_BODY_SIZE", 10*1024*1024)),
-		ReadTimeout:     time.Duration(getEnvInt("READ_TIMEOUT_SEC", 30)) * time.Second,
-		WriteTimeout:    time.Duration(getEnvInt("WRITE_TIMEOUT_SEC", 10)) * time.Second,
-		HealthPort:      getEnv("HEALTH_PORT", "8080"),
+		Port:             getEnv("ICAP_PORT", "11344"),
+		LogFile:          getEnv("LOG_FILE", "/var/log/icap/icap_logger.log"),
+		LogRotateSizeMB:  int64(getEnvInt("LOG_ROTATE_SIZE_MB", 25)),
+		MaxFileRetention: getEnvInt("LOG_FILE_RETENTION", 60),
+		MaxBodySize:      int64(getEnvInt("MAX_BODY_SIZE", 25*1024*1024)),
+		ReadTimeout:      time.Duration(getEnvInt("READ_TIMEOUT_SEC", 30)) * time.Second,
+		WriteTimeout:     time.Duration(getEnvInt("WRITE_TIMEOUT_SEC", 10)) * time.Second,
+		HealthPort:       getEnv("HEALTH_PORT", "8080"),
+		RedactAuthHeader: getEnvBool("REDACT_AUTH_HEADER", true),
 	}
 	for _, arg := range os.Args[1:] {
 		switch {
@@ -48,4 +50,12 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	return v == "true" || v == "1" || v == "yes"
 }

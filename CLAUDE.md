@@ -72,9 +72,30 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
 
 ### Body sanitization
 - Plain text → log as-is
-- Binary (>10% non-printable in first 512 bytes) → "[binary: N bytes]"
+- Binary (>10% non-printable in first 512 bytes) → `[binary: N bytes]`
 - multipart/form-data → per-part summary
-- CONNECT (tunnel) → "[tunneled: HTTPS traffic, body not inspectable]"
+- CONNECT (tunnel) → `[tunneled: HTTPS traffic, body not inspectable]`
+- **Base64-in-JSON payloads** — `isBinary()` never fires on Base64 because all chars are
+  printable ASCII. `sanitizeBody()` JSON-parses the body and calls `looksLikeBase64()`
+  on every string value, redacting any that exceed 512 chars and pass the alphabet + decode probe.
+  Three Base64 variants are detected:
+  - Standard Base64 (RFC 4648 §4): `+` and `/`
+  - URL-safe Base64 (RFC 4648 §5): `-` and `_` (used by JWT, many REST APIs)
+  - MIME-wrapped Base64 (RFC 2045): `\r\n` every 76 chars (Java `getMimeEncoder`, email)
+  The Base64 prefix varies by file type (`LS1Z` = multipart `--`, `JVBE` = PDF, `iVBO` = PNG, `UEsD` = ZIP).
+  No specific prefix is assumed — the check is alphabet + decode probe only.
+
+### Response timing
+
+- `204 No Modifications` is sent **immediately** after `readICAPMessage()` returns,
+  before `parseICAP()`, `json.Marshal()`, or any file I/O.
+- All logging runs in a `go func()` goroutine so large payloads (e.g. 4 MB file uploads)
+  never delay the ICAP response and cause `ERR_ICAP_FAILURE` on the client.
+
+### Date header
+
+- The ICAP `Date` header is deleted from `icap_headers` after map construction.
+  It is the same moment as the top-level `timestamp` field — logging it twice is redundant.
 
 ---
 
@@ -107,6 +128,20 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
 5. **OPTIONS returns 204** — Original bug. Squid marks service [down,!opt].
    OPTIONS must return 200 OK with capability headers.
 
+6. **Base64-in-JSON payloads cause silent data leakage** — A client embedding a 4 MB file
+   as Base64 in a JSON string field (e.g. `{"raw":"LS1Z..."}`) passes `isBinary()` because
+   Base64 output is all printable ASCII. Fix: `sanitizeJSONBody()` walks the parsed JSON tree
+   and redacts any string value that passes `looksLikeBase64()`. Covers standard, URL-safe,
+   and MIME-wrapped variants. The redaction marker shows estimated decoded size.
+
+7. **ERR_ICAP_FAILURE 500 on large payloads** — `json.Marshal` + file write after reading a
+   4 MB body can exceed Squid's ICAP response deadline. Fix: send `204` immediately after
+   `readICAPMessage()` returns, then parse and log asynchronously in a goroutine.
+
+8. **Duplicate timestamp in icap_headers.Date** — Squid sends a `Date` header in every ICAP
+   request. It represents the same moment as the top-level `timestamp`. Fix: `delete()`
+   the `Date` key from `icap_headers` after building the map.
+
 ---
 
 ## Environment Variables
@@ -116,11 +151,27 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
 | ICAP_PORT | 11344 | TCP listen port |
 | LOG_FILE | /var/log/icap/icap_logger.log | JSON log path |
 | LOG_ROTATE_SIZE_MB | 25 | Rotate after N MB |
-| MAX_BODY_SIZE | 10485760 | Max body bytes (10 MB) |
+| LOG_FILE_RETENTION | 60 | Max compressed (.gz) archive files to keep. Oldest deleted first. 0 = unlimited. |
+| MAX_BODY_SIZE | 25MB | Max body bytes per connection |
 | READ_TIMEOUT_SEC | 30 | TCP read timeout |
 | WRITE_TIMEOUT_SEC | 10 | TCP write timeout |
 | HEALTH_PORT | 8080 | Health check HTTP port |
 | TZ | Australia/ACT | Container timezone |
+| REDACT_AUTH_HEADER | true | Redact Authorization / Proxy-Authorization headers. Set false to log raw values (debug only). |
+
+## Log Rotation Behaviour
+
+1. Active file exceeds `LOG_ROTATE_SIZE_MB` → renamed with timestamp suffix
+   e.g. `icap_logger.log.20260311-165838`
+2. Renamed file compressed to `.gz` in a background goroutine
+   (never blocks the ICAP write path)
+3. Uncompressed renamed file deleted after successful compression
+4. If `.gz` count exceeds `LOG_FILE_RETENTION`, oldest archives deleted first
+   (lexicographic sort on `YYYYMMDD-HHMMSS` suffix = chronological order)
+5. If the file is not compressed, it is removed after the rotation
+6. If the file is compressed, it is removed after the `.gz` is confirmed written and synced
+7. If compression fails the raw file is kept
+8. Retention is enforced by `pruneOldArchives()` in the same goroutine
 
 ---
 

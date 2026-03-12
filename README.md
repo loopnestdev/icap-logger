@@ -11,10 +11,9 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 - RFC 3507 offset-based encapsulated section parsing (`req-hdr`, `res-hdr`, `req-body`, `res-body`, `null-body`)
 - Non-blocking ICAP message reading — reads complete messages without waiting for EOF (required for Squid compatibility)
 - Chunked HTTP body decoding
-- **Smart body logging** — plain text logged as-is; binary, file uploads, and blobs replaced with safe metadata summaries
+- **Smart body logging** — plain text logged as-is; binary, file uploads, and Base64-encoded file payloads inside JSON replaced with safe metadata summaries
 - **Tunnel detection** — `CONNECT` (HTTPS tunnel) requests are flagged with `"tunneled": true` and an explanatory note
 - Millisecond-precision timestamps in local timezone
-- ICAP `Date` header reformatted from GMT to container local timezone
 - Structured JSON logging to stdout via `log/slog`
 - Built-in log rotation — no external dependencies
 - Graceful shutdown on `SIGTERM` / `SIGINT` with 15-second drain
@@ -33,9 +32,9 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 3. Answers `OPTIONS` probes immediately so Squid marks the service as up
 4. Parses `REQMOD` / `RESPMOD` using RFC 3507 byte offsets from the `Encapsulated` header
 5. Extracts ICAP headers, encapsulated HTTP request/response headers, and chunked body
-6. Sanitises the body before logging — text payloads are printed; binary/file content is replaced with metadata
-7. Writes a structured JSON log entry to `/var/log/icap/icap_logger.log` (configurable via `LOG_FILE`)
-8. Responds with `ICAP/1.0 204 No Modifications`
+6. Sends `ICAP/1.0 204 No Modifications` immediately after reading the message — before any parsing or I/O — so large payloads never delay the response and cause client timeouts
+7. Parses and sanitises the request asynchronously — text payloads are logged in full; binary/file content is replaced with safe metadata
+8. Writes a structured JSON log entry to `/var/log/icap/icap_logger.log` (configurable via `LOG_FILE`)
 9. Exposes `/healthz` on port `8080` (configurable via `HEALTH_PORT`)
 
 ---
@@ -51,7 +50,6 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
   "icap_url": "icap://<ICAP_SERVER_IP>:11344/reqmod",
   "icap_headers": {
     "Allow": "204, trailers",
-    "Date": "2026-03-02T17:02:56.000+11:00",
     "Encapsulated": "req-hdr=0, req-body=143",
     "Host": "<ICAP_SERVER_IP>:11344",
     "X-Client-Ip": "<CLIENT_IP>"
@@ -116,12 +114,15 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 |---|---|---|
 | Plain text, JSON, XML, form data | `application/json`, `text/plain` | ✅ Full content |
 | Binary blob (image, PDF, zip, exe) | `image/jpeg`, `application/zip` | `[binary: 8192 bytes]` |
+| JSON field containing Base64-encoded file | `application/json` | `[redacted: base64 payload ~4194488 bytes]` |
 | Multipart file upload — file part | `multipart/form-data` | `[file: "report.pdf", content-type: "application/pdf", 204800 bytes]` |
 | Multipart file upload — text field | `multipart/form-data` | `[field: "username" = "alice"]` |
 | Multipart file upload — binary field | `multipart/form-data` | `[field: "data", binary, 1024 bytes]` |
 | HTTPS tunnel (CONNECT) | — | `[tunneled: HTTPS traffic, body not inspectable]` |
 
 > Binary detection samples the first 512 bytes — if more than 10% are non-printable the body is treated as binary.
+
+> Base64 detection walks every JSON string field and redacts any value longer than 512 chars whose characters are entirely within the Base64 alphabet (standard `+/`, URL-safe `-_`, or MIME-wrapped with `\r\n` line breaks) and that passes a decode probe. The `raw` field value is never printed regardless of the underlying file type.
 
 > HTTPS traffic sent through a `CONNECT` tunnel is end-to-end encrypted. No ICAP server can inspect its body without Squid SSL Bump (TLS interception) configured on the proxy.
 
@@ -169,6 +170,8 @@ All settings are configurable via environment variables. CLI flags take preceden
 | `WRITE_TIMEOUT_SEC` | `10` | — | TCP write timeout in seconds |
 | `HEALTH_PORT` | `8080` | — | HTTP health check listen port |
 | `TZ` | system default | — | Container timezone (e.g. `Australia/ACT`) |
+| `REDACT_AUTH_HEADER` | `true` | — | Redact `Authorization` and `Proxy-Authorization` header values. Set `false` to log raw values (debug only). |
+| `LOG_FILE_RETENTION` | `60` | — | Maximum number of compressed (`.gz`) archive files to retain. When exceeded, the oldest archives are deleted. Set `0` for unlimited. |
 
 ---
 
@@ -425,12 +428,10 @@ go tool cover -html=coverage.out
 - **Only plain text payloads are logged in full** — binary data, file uploads, and blobs are replaced with safe metadata summaries
 - `CONNECT` (HTTPS tunnel) requests are logged with `"tunneled": true`; the body is unavailable by design unless Squid SSL Bump is configured
 - Timestamps use millisecond precision in the container's local timezone (`"2026-03-02T17:02:56.123+11:00"`)
-- The ICAP `Date` header (sent by Squid in GMT) is converted to local timezone in the log
+- The ICAP `Date` header sent by Squid is intentionally omitted from `icap_headers` — it is the same moment as the top-level `timestamp` field
+- `204 No Modifications` is sent to the client **immediately** after reading the ICAP message; all parsing, sanitisation, and file I/O happens asynchronously in a goroutine so large payloads (e.g. 4 MB file uploads) never cause `ERR_ICAP_FAILURE` timeouts
 - Log rotation renames the active file with a timestamp suffix (e.g. `icap_logger.log.20260302-170256`) and opens a fresh file
 - Structured JSON server events go to **stdout** (suitable for container log collectors); ICAP data goes to the **rotating log file**
 - All connections are handled **concurrently** via goroutines with per-connection read/write deadlines
 - Zero external Go dependencies — the entire project uses the standard library only
 - The `./logs/` directory is excluded from git via `.gitignore`
-
-
----

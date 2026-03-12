@@ -195,68 +195,81 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 		return
 	}
 
-	info := parseICAP(buf)
-
-	// A CONNECT request establishes an opaque TLS tunnel — Squid forwards
-	// only the CONNECT line to ICAP (null-body), so no request body is ever
-	// available regardless of what the client sends through the tunnel.
-	tunneled := info.reqMethod == "CONNECT"
-
-	reqBody := info.reqBody
-	if tunneled && reqBody == "" {
-		reqBody = "[tunneled: HTTPS traffic, body not inspectable]"
-	}
-
-	// "2006-01-02T15:04:05.000Z07:00" is RFC3339 with exactly 3ms digits.
-	const tsFormat = "2006-01-02T15:04:05.000Z07:00"
-
-	entry := logEntry{
-		Timestamp:      time.Now().Format(tsFormat),
-		ICAPMethod:     info.icapMethod,
-		ICAPURL:        info.icapURL,
-		ReqMethod:      info.reqMethod,
-		ReqPath:        info.reqPath,
-		DestinationURL: info.destinationURL,
-		Tunneled:       tunneled,
-		ReqBody:        reqBody,
-		RespStatus:     info.respStatus,
-		RespBody:       info.respBody,
-	}
-
-	if len(info.icapHeaders) > 0 {
-		entry.ICAPHeaders = headersToMap(info.icapHeaders)
-		// Squid sets Date in RFC 1123 / GMT. Reformat to local timezone so
-		// all timestamps in the log entry are consistent.
-		if dateStr, ok := entry.ICAPHeaders["Date"]; ok {
-			// RFC 1123 carries no sub-second precision; parse it and reformat
-			// with milliseconds using the same tsFormat as the timestamp field.
-			if t, err := time.Parse(time.RFC1123, dateStr); err == nil {
-				entry.ICAPHeaders["Date"] = t.Local().Format(tsFormat)
-			}
-		}
-	}
-	if len(info.reqHeaders) > 0 {
-		entry.ReqHeaders = headersToMap(info.reqHeaders)
-	}
-	if len(info.respHeaders) > 0 {
-		entry.RespHeaders = headersToMap(info.respHeaders)
-	}
-
-	data, err := json.Marshal(entry)
-	if err != nil {
-		errEntry, _ := json.Marshal(map[string]string{
-			"error": fmt.Sprintf("failed to marshal log entry: %v", err),
-		})
-		logger.Println(string(errEntry))
-	} else {
-		logger.Println(string(data))
-	}
-
+	// ── Send 204 FIRST before any logging/marshaling ──────────────────────────
+	// Critical: Squid/C-ICAP has a short response deadline. For large payloads
+	// (e.g. 4MB file uploads), JSON marshaling + file I/O can exceed that
+	// deadline causing ERR_ICAP_FAILURE 500 on the client side.
 	if err := conn.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout)); err != nil {
 		slog.Warn("failed to set write deadline", "err", err)
 		return
 	}
 	if _, err := conn.Write([]byte("ICAP/1.0 204 No Modifications\r\nConnection: close\r\n\r\n")); err != nil {
 		logger.Println(`{"error":"failed to write ICAP response"}`)
+		return
+	}
+
+	// ── Log asynchronously so we never block the ICAP response path ──────────
+	go func() {
+		info := parseICAP(buf)
+
+		tunneled := info.reqMethod == "CONNECT"
+		reqBody := info.reqBody
+		if tunneled && reqBody == "" {
+			reqBody = "tunneled"
+		}
+
+		const tsFormat = "2006-01-02T15:04:05.000Z07:00"
+		entry := logEntry{
+			Timestamp:      time.Now().Format(tsFormat),
+			ICAPMethod:     info.icapMethod,
+			ICAPURL:        info.icapURL,
+			ReqMethod:      info.reqMethod,
+			ReqPath:        info.reqPath,
+			DestinationURL: info.destinationURL,
+			Tunneled:       tunneled,
+			ReqBody:        reqBody,
+			RespStatus:     info.respStatus,
+			RespBody:       info.respBody,
+		}
+
+		if len(info.icapHeaders) > 0 {
+			entry.ICAPHeaders = headersToMap(info.icapHeaders)
+			// "Date" in icap_headers duplicates the top-level "timestamp" field.
+			// Drop it to keep the log compact and unambiguous.
+			delete(entry.ICAPHeaders, "Date")
+		}
+		if len(info.reqHeaders) > 0 {
+			entry.ReqHeaders = headersToMap(info.reqHeaders)
+			if cfg.RedactAuthHeader {
+				redactAuthHeaders(entry.ReqHeaders)
+			}
+		}
+		if len(info.respHeaders) > 0 {
+			entry.RespHeaders = headersToMap(info.respHeaders)
+			if cfg.RedactAuthHeader {
+				redactAuthHeaders(entry.RespHeaders)
+			}
+		}
+
+		data, err := json.Marshal(entry)
+		if err != nil {
+			errEntry, _ := json.Marshal(map[string]string{
+				"error": fmt.Sprintf("failed to marshal log entry: %v", err),
+			})
+			logger.Println(string(errEntry))
+		} else {
+			logger.Println(string(data))
+		}
+	}()
+}
+
+// redactAuthHeaders replaces the value of any Authorization or
+// Proxy-Authorization header with "[redacted]".
+func redactAuthHeaders(headers map[string]string) {
+	for k := range headers {
+		switch strings.ToLower(k) {
+		case "authorization", "proxy-authorization":
+			headers[k] = "[redacted]"
+		}
 	}
 }

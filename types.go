@@ -8,13 +8,15 @@ import (
 // Config holds all runtime configuration loaded from environment variables,
 // with optional CLI flag overrides (--port=, --log=, --log-rotate-size=).
 type Config struct {
-	Port            string
-	LogFile         string
-	LogRotateSizeMB int64
-	MaxBodySize     int64
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	HealthPort      string
+	Port             string
+	LogFile          string
+	LogRotateSizeMB  int64
+	MaxFileRetention int    // LOG_FILE_RETENTION env var — default 60
+	MaxBodySize      int64
+	ReadTimeout      time.Duration
+	WriteTimeout     time.Duration
+	HealthPort       string
+	RedactAuthHeader bool // REDACT_AUTH_HEADER env var — default true
 }
 
 // icapInfo holds parsed information from an ICAP request.

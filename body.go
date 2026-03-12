@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -10,6 +12,10 @@ import (
 	"strconv"
 	"strings"
 )
+
+// largeStringThreshold — JSON string values longer than this are checked for
+// Base64 content and redacted if they look like encoded binary/file payloads.
+const largeStringThreshold = 512
 
 // decodeChunked decodes a chunked-transfer-encoded body and returns it as a string.
 func decodeChunked(data []byte) string {
@@ -38,8 +44,7 @@ func decodeChunked(data []byte) string {
 	return result.String()
 }
 
-// isChunkedBody returns true if data looks like a chunked-encoded body
-// (i.e. the first line is a valid hex chunk size).
+// isChunkedBody returns true if data looks like a chunked-encoded body.
 func isChunkedBody(data []byte) bool {
 	line := strings.SplitN(string(data), "\r\n", 2)[0]
 	line = strings.TrimSpace(line)
@@ -50,9 +55,7 @@ func isChunkedBody(data []byte) bool {
 	return err == nil
 }
 
-// isBinary returns true if more than 10% of the first 512 bytes are non-printable
-// (excluding tab, newline, carriage return). This reliably identifies binary blobs
-// such as images, PDFs, compressed archives, and executables.
+// isBinary returns true if more than 10% of the first 512 bytes are non-printable.
 func isBinary(data []byte) bool {
 	sample := data
 	if len(sample) > 512 {
@@ -70,9 +73,116 @@ func isBinary(data []byte) bool {
 	return nonPrintable*100/len(sample) > 10
 }
 
+// looksLikeBase64 returns true if s is a large Base64-encoded payload.
+//
+// Three encoding variants are recognised:
+//   - Standard Base64      (RFC 4648 §4): alphabet A-Za-z0-9+/=
+//   - URL-safe Base64      (RFC 4648 §5): alphabet A-Za-z0-9-_=  (used by JWT, many REST APIs)
+//   - MIME-wrapped Base64  (RFC 2045):    standard alphabet with \r\n every 76 chars
+//     (used by Java Base64.getMimeEncoder, email attachments, some PDF encoders)
+//
+// The Base64 prefix depends entirely on the first bytes of the original file, so
+// it varies by file type (e.g. PDF → "JVBE", PNG → "iVBO", ZIP → "UEsD").
+// No specific prefix is assumed.
+func looksLikeBase64(s string) bool {
+	if len(s) < largeStringThreshold {
+		return false
+	}
+
+	// Strip MIME line-wrap whitespace (\r\n) to support MIME-wrapped Base64.
+	// Only strip if the non-whitespace portion is still long enough.
+	stripped := strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' {
+			return -1
+		}
+		return r
+	}, s)
+	if len(stripped) < largeStringThreshold {
+		return false
+	}
+
+	// Detect which Base64 alphabet is in use and pick the right decoder.
+	// URL-safe Base64 uses '-' and '_'; standard uses '+' and '/'.
+	// Both may use '=' padding.
+	urlSafe := false
+	for i := 0; i < len(stripped); i++ {
+		c := stripped[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '=' {
+			continue
+		}
+		if c == '-' || c == '_' {
+			urlSafe = true
+			continue
+		}
+		if c == '+' || c == '/' {
+			continue
+		}
+		// Character outside all known Base64 alphabets → not Base64.
+		return false
+	}
+
+	// Decode a sample prefix to confirm structural validity.
+	sample := stripped
+	if len(sample) > 64 {
+		sample = stripped[:64]
+	}
+	if pad := len(sample) % 4; pad != 0 {
+		sample += strings.Repeat("=", 4-pad)
+	}
+	if urlSafe {
+		_, err := base64.URLEncoding.DecodeString(sample)
+		return err == nil
+	}
+	_, err := base64.StdEncoding.DecodeString(sample)
+	return err == nil
+}
+
+// redactJSONLargeStrings walks a decoded JSON value tree and replaces any string
+// value that exceeds largeStringThreshold AND looks like Base64 with a safe
+// redaction marker. All other values are returned unchanged.
+func redactJSONLargeStrings(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		for k, child := range val {
+			val[k] = redactJSONLargeStrings(child)
+		}
+		return val
+	case []any:
+		for i, child := range val {
+			val[i] = redactJSONLargeStrings(child)
+		}
+		return val
+	case string:
+		if looksLikeBase64(val) {
+			// Estimate decoded size: Base64 encodes 3 bytes per 4 chars
+			decoded := len(val) * 3 / 4
+			return fmt.Sprintf("[redacted: base64 payload ~%d bytes]", decoded)
+		}
+		return val
+	default:
+		return v
+	}
+}
+
+// sanitizeJSONBody parses a JSON body, redacts large Base64 string fields,
+// and re-serializes. Returns the original body if parsing fails.
+func sanitizeJSONBody(body string) string {
+	var v any
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		// Not valid JSON — fall through to binary/text check
+		return ""
+	}
+	v = redactJSONLargeStrings(v)
+	out, err := json.Marshal(v)
+	if err != nil {
+		return body
+	}
+	return string(out)
+}
+
 // parseMultipartBody parses a multipart/form-data body and returns a human-readable
-// summary of each part. File parts are replaced with [file: "name", N bytes],
-// binary fields with [field: "name", binary, N bytes], and text fields are inlined.
+// summary of each part.
 func parseMultipartBody(body, boundary string) string {
 	mr := multipart.NewReader(strings.NewReader(body), boundary)
 	var parts []string
@@ -89,7 +199,6 @@ func parseMultipartBody(body, boundary string) string {
 			ct = "application/octet-stream"
 		}
 		if filename != "" {
-			// File upload part — never log content, just metadata
 			parts = append(parts, fmt.Sprintf(`[file: %q, content-type: %q, %d bytes]`, filename, ct, len(data)))
 		} else if isBinary(data) {
 			parts = append(parts, fmt.Sprintf(`[field: %q, binary, %d bytes]`, fieldName, len(data)))
@@ -105,24 +214,45 @@ func parseMultipartBody(body, boundary string) string {
 
 // sanitizeBody inspects a decoded body string and returns a safe log-friendly
 // representation:
-//   - multipart/form-data → per-part summary (filename, size, content-type)
-//   - binary content      → [binary: N bytes]
-//   - plain text          → returned as-is
+//   - multipart/form-data          → per-part summary
+//   - application/json             → JSON with Base64 fields redacted
+//   - binary content               → [binary: N bytes]
+//   - plain text                   → returned as-is
 func sanitizeBody(body, contentType string) string {
 	if body == "" {
 		return ""
 	}
+
+	ct := ""
+	var params map[string]string
 	if contentType != "" {
-		ct, params, err := mime.ParseMediaType(contentType)
-		if err == nil && strings.HasPrefix(ct, "multipart/") {
-			if boundary, ok := params["boundary"]; ok {
-				return parseMultipartBody(body, boundary)
-			}
+		var err error
+		ct, params, err = mime.ParseMediaType(contentType)
+		if err != nil {
+			ct = ""
 		}
 	}
+
+	// ── multipart ──────────────────────────────────────────────────────────────
+	if strings.HasPrefix(ct, "multipart/") {
+		if boundary, ok := params["boundary"]; ok {
+			return parseMultipartBody(body, boundary)
+		}
+	}
+
+	// ── JSON — walk and redact Base64 string fields ────────────────────────────
+	if ct == "application/json" || strings.HasSuffix(ct, "+json") || ct == "" {
+		if sanitized := sanitizeJSONBody(body); sanitized != "" {
+			return sanitized
+		}
+		// sanitizeJSONBody returns "" only when Unmarshal fails → fall through
+	}
+
+	// ── binary blob ────────────────────────────────────────────────────────────
 	if isBinary([]byte(body)) {
 		return fmt.Sprintf("[binary: %d bytes]", len(body))
 	}
+
 	return body
 }
 

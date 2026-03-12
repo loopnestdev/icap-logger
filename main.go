@@ -25,7 +25,7 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	logWriter, err := newRotatingWriter(cfg.LogFile, cfg.LogRotateSizeMB)
+	logWriter, err := newRotatingWriter(cfg.LogFile, cfg.LogRotateSizeMB, cfg.MaxFileRetention)
 	if err != nil {
 		slog.Error("failed to open log file", "path", cfg.LogFile, "err", err)
 		os.Exit(1)
