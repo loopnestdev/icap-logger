@@ -301,16 +301,58 @@ docker run -d \
 
 ## Squid Configuration
 
-Point Squid at icap-logger by adding the following to `squid.conf`:
+### REQMOD only (log outbound requests)
 
-```
-# ICAP service declaration
+Add the following to `squid.conf`:
+
+```squid
 icap_enable on
-icap_service icap_logger reqmod_precache bypass=1 icap://<ICAP_SERVER_IP>:11344/reqmod
 
-# Apply to all requests
-adaptation_access icap_logger allow all
+icap_service req_logger reqmod_precache bypass=on icap://<ICAP_SERVER_IP>:11344/reqmod
+
+adaptation_access req_logger allow all
 ```
+
+### REQMOD + RESPMOD (log requests and responses)
+
+This is the recommended configuration for full visibility including `resp_status`, `resp_headers`, and `resp_body`:
+
+```squid
+icap_enable on
+
+icap_service req_logger  reqmod_precache  bypass=on icap://<ICAP_SERVER_IP>:11344/reqmod
+icap_service resp_logger respmod_precache bypass=on icap://<ICAP_SERVER_IP>:11344/respmod
+
+adaptation_access req_logger  allow all
+adaptation_access resp_logger allow all
+```
+
+### With ClamAV (or another ICAP scanner) in the same chain
+
+When chaining icap-logger with an antivirus or DLP scanner, use `adaptation_service_chain` so both services run sequentially. **Do not use two separate `adaptation_access` rules for the same direction** — Squid treats them as a service set (one-of) and only calls one.
+
+```squid
+icap_enable on
+icap_send_client_ip on
+
+# ── ICAP services ──────────────────────────────────────────────────────────────
+icap_service service_avi_req  reqmod_precache  bypass=off icap://<SCANNER_IP>:1344/squidclamav
+icap_service service_avi_resp respmod_precache bypass=off icap://<SCANNER_IP>:1344/squidclamav
+icap_service req_logger       reqmod_precache  bypass=on  icap://<ICAP_SERVER_IP>:11344/reqmod
+icap_service resp_logger      respmod_precache bypass=on  icap://<ICAP_SERVER_IP>:11344/respmod
+
+# ── Sequential chains: scanner first, then logger ─────────────────────────────
+adaptation_service_chain req_chain  service_avi_req  req_logger
+adaptation_service_chain resp_chain service_avi_resp resp_logger
+
+# ── Apply chains to all traffic ────────────────────────────────────────────────
+adaptation_access req_chain  allow all
+adaptation_access resp_chain allow all
+```
+
+> **Chain order matters:** if the scanner blocks a request (returns `403`), the chain is interrupted and icap-logger does not fire for that transaction — which is the correct behaviour.
+
+> **`bypass=on` vs `bypass=off`:** use `bypass=on` for icap-logger (fail open — traffic continues if the logger is down) and `bypass=off` for security scanners (fail closed — block traffic if the scanner is unreachable).
 
 > **HTTPS body logging** requires Squid SSL Bump (TLS interception). Without it, `CONNECT` requests are logged with `"tunneled": true` and the body is not available — this is a fundamental TLS property, not a limitation of icap-logger.
 
@@ -338,7 +380,8 @@ printf "OPTIONS icap://localhost:11344/reqmod ICAP/1.0\r\nHost: localhost\r\n\r\
 ```
 
 Expected response:
-```
+
+```text
 ICAP/1.0 200 OK
 Methods: REQMOD
 Service: icap-logger/1.0
