@@ -450,7 +450,60 @@ func TestSanitizeBody_NoContentEncoding(t *testing.T) {
 		t.Errorf("plain JSON with no content-encoding must be logged, got: %q", got)
 	}
 }
+func TestSanitizeBody_OctetStreamJSONBase64Redacted(t *testing.T) {
+	// Reproduce the exact AzCopy / Azure SDK production case:
+	// Content-Type is application/octet-stream but the body is a JSON document
+	// with a large Base64-encoded 'raw' field.  The field must still be redacted.
+	payload := strings.Repeat("A", 600) // >512-byte value that passes looksLikeBase64
+	encoded := base64.StdEncoding.EncodeToString([]byte(payload))
 
+	body := `{"name":"test.bin","raw":"` + encoded + `"}`
+
+	got := sanitizeBody(body, "application/octet-stream", "")
+
+	if strings.Contains(got, encoded[:50]) {
+		t.Fatalf("Base64 payload in octet-stream body must be redacted, got raw base64 in: %.200s", got)
+	}
+	if !strings.Contains(got, "[redacted: base64 payload") {
+		t.Fatalf("expected redaction marker, got: %.200s", got)
+	}
+	if !strings.Contains(got, "test.bin") {
+		t.Fatalf("non-base64 fields must be preserved, got: %.200s", got)
+	}
+}
+
+func TestSanitizeBody_EmptyContentTypeJSONBase64Redacted(t *testing.T) {
+	// No Content-Type header at all (ct == "") — must hit the explicit JSON
+	// branch (step 4 in sanitizeBody) and still redact Base64 fields.
+	encoded := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("B", 600)))
+	body := `{"file":"` + encoded + `"}`
+
+	got := sanitizeBody(body, "", "")
+
+	if strings.Contains(got, encoded[:50]) {
+		t.Fatalf("Base64 payload with empty Content-Type must be redacted, got: %.200s", got)
+	}
+	if !strings.Contains(got, "[redacted: base64 payload") {
+		t.Fatalf("expected redaction marker, got: %.200s", got)
+	}
+}
+
+func TestSanitizeBody_TextPlainJSONBase64Redacted(t *testing.T) {
+	// Content-Type: text/plain but the body is a JSON document containing a
+	// large Base64-encoded field.  text/plain skips the explicit JSON branch
+	// (step 4) but the content-sniff fallback (step 6) must catch it.
+	encoded := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("C", 600)))
+	body := `{"attachment":"` + encoded + `"}`
+
+	got := sanitizeBody(body, "text/plain", "")
+
+	if strings.Contains(got, encoded[:50]) {
+		t.Fatalf("Base64 payload with text/plain Content-Type must be redacted, got: %.200s", got)
+	}
+	if !strings.Contains(got, "[redacted: base64 payload") {
+		t.Fatalf("expected redaction marker, got: %.200s", got)
+	}
+}
 func TestIsBinary_GzipBytes(t *testing.T) {
 	// gzip magic: 0x1F 0x8B — 0x8B is a UTF-8 continuation byte without a
 	// leading byte, making the sequence invalid UTF-8. isBinary must catch this.
@@ -480,7 +533,7 @@ func TestIsCompressedEncoding(t *testing.T) {
 		{"br", true},
 		{"zstd", true},
 		{"compress", true},
-		{"GZIP", true},          // case-insensitive
+		{"GZIP", true},           // case-insensitive
 		{"gzip, identity", true}, // comma-separated
 		{"identity", false},
 		{"", false},

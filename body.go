@@ -249,8 +249,11 @@ func isCompressedEncoding(contentEncoding string) bool {
 // representation:
 //   - compressed (Content-Encoding: gzip/deflate/br/zstd) → [binary: N bytes, content-encoding: X]
 //   - multipart/form-data                                  → per-part summary
-//   - application/json                                     → JSON with Base64 fields redacted
+//   - application/json (or +json)                          → JSON with Base64 fields redacted
 //   - binary content (invalid UTF-8 or high control-char density) → [binary: N bytes]
+//   - any other non-binary body that parses as JSON        → JSON with Base64 fields redacted
+//     (content-sniff fallback — catches application/octet-stream uploads, e.g.
+//     AzCopy / Azure SDK, that carry a JSON body but declare a non-JSON Content-Type)
 //   - plain text                                           → returned as-is
 func sanitizeBody(body, contentType, contentEncoding string) string {
 	if body == "" {
@@ -293,6 +296,15 @@ func sanitizeBody(body, contentType, contentEncoding string) string {
 	// ── binary blob ────────────────────────────────────────────────────────────
 	if isBinary([]byte(body)) {
 		return fmt.Sprintf("[binary: %d bytes]", len(body))
+	}
+
+	// ── content-sniff: JSON with Base64 fields in a non-JSON Content-Type ────────
+	// Handles uploads where the HTTP client declares application/octet-stream (or
+	// any other non-JSON type) but the body is actually a JSON document containing
+	// large Base64-encoded fields.  sanitizeJSONBody returns "" for non-JSON input
+	// so plain-text bodies fall through unchanged.
+	if sanitized := sanitizeJSONBody(body); sanitized != "" {
+		return sanitized
 	}
 
 	return body
