@@ -310,6 +310,58 @@ func sanitizeBody(body, contentType, contentEncoding string) string {
 	return body
 }
 
+// isTokenKey returns true when a JSON key name indicates a security token
+// value.  Matching rule: the lowercased key ends with "token" — this catches
+// access_token, refresh_token, id_token, device_token, session_token, token,
+// etc.  It intentionally does NOT match "token_type" (ends with "type") whose
+// value is the harmless string "Bearer".
+func isTokenKey(key string) bool {
+	l := strings.ToLower(key)
+	return l == "token" || strings.HasSuffix(l, "_token") || strings.HasSuffix(l, "token")
+}
+
+// redactTokenFields walks a decoded JSON value tree and replaces any string
+// value whose key name matches isTokenKey with "[redacted: token]".
+func redactTokenFields(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		for k, child := range val {
+			if s, ok := child.(string); ok && isTokenKey(k) && s != "" {
+				val[k] = "[redacted: token]"
+			} else {
+				val[k] = redactTokenFields(child)
+			}
+		}
+		return val
+	case []any:
+		for i, child := range val {
+			val[i] = redactTokenFields(child)
+		}
+		return val
+	default:
+		return v
+	}
+}
+
+// redactTokenBody parses body as JSON and replaces any token-named string
+// field with "[redacted: token]".  Returns the original body unchanged when
+// it is not valid JSON (e.g. a [binary: N bytes] marker or plain text).
+func redactTokenBody(body string) string {
+	if body == "" {
+		return body
+	}
+	var v any
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		return body // not JSON — leave as-is
+	}
+	v = redactTokenFields(v)
+	out, err := json.Marshal(v)
+	if err != nil {
+		return body
+	}
+	return string(out)
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a

@@ -575,6 +575,92 @@ func base64Encode(src []byte) string {
 	return sb.String()
 }
 
+// ── redactTokenBody unit tests ────────────────────────────────────────────────
+
+func TestRedactTokenBody_AccessToken(t *testing.T) {
+	// Exact production case: Azure Container Registry /oauth2/token response.
+	jwt := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.signature"
+	body := `{"access_token":"` + jwt + `"}`
+	got := redactTokenBody(body)
+	if strings.Contains(got, jwt) {
+		t.Fatalf("access_token value must be redacted, got: %s", got)
+	}
+	if !strings.Contains(got, "[redacted: token]") {
+		t.Fatalf("expected redaction marker, got: %s", got)
+	}
+}
+
+func TestRedactTokenBody_MultipleTokenFields(t *testing.T) {
+	// refresh_token, id_token and access_token must all be redacted.
+	body := `{"access_token":"aaa","refresh_token":"bbb","id_token":"ccc","token_type":"Bearer","expires_in":3600}`
+	got := redactTokenBody(body)
+	for _, secret := range []string{"aaa", "bbb", "ccc"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("token value %q must be redacted, got: %s", secret, got)
+		}
+	}
+	// token_type value must NOT be redacted
+	if !strings.Contains(got, "Bearer") {
+		t.Fatalf("token_type=Bearer must be preserved, got: %s", got)
+	}
+	// Non-token fields must be preserved
+	if !strings.Contains(got, "3600") {
+		t.Fatalf("expires_in must be preserved, got: %s", got)
+	}
+}
+
+func TestRedactTokenBody_NestedTokenField(t *testing.T) {
+	// Token inside a nested object must also be redacted.
+	body := `{"auth":{"access_token":"secret","scope":"read"}}`
+	got := redactTokenBody(body)
+	if strings.Contains(got, "secret") {
+		t.Fatalf("nested access_token must be redacted, got: %s", got)
+	}
+	if !strings.Contains(got, "read") {
+		t.Fatalf("non-token nested field must be preserved, got: %s", got)
+	}
+}
+
+func TestRedactTokenBody_NotJSON(t *testing.T) {
+	// Non-JSON body (marker, plain text) must pass through unchanged.
+	for _, body := range []string{
+		"[binary: 1024 bytes]",
+		"[redacted: base64 payload ~5000 bytes]",
+		"plain text response",
+		"",
+	} {
+		got := redactTokenBody(body)
+		if got != body {
+			t.Errorf("non-JSON body must be unchanged: input=%q got=%q", body, got)
+		}
+	}
+}
+
+func TestIsTokenKey(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"access_token", true},
+		{"refresh_token", true},
+		{"id_token", true},
+		{"device_token", true},
+		{"session_token", true},
+		{"token", true},
+		{"AccessToken", true},  // camelCase
+		{"refreshToken", true}, // camelCase
+		{"token_type", false},  // must NOT match — value is "Bearer"
+		{"expires_in", false},
+		{"scope", false},
+		{"client_id", false},
+	}
+	for _, c := range cases {
+		if got := isTokenKey(c.key); got != c.want {
+			t.Errorf("isTokenKey(%q) = %v, want %v", c.key, got, c.want)
+		}
+	}
+}
+
 // ── redactAuthHeaders unit tests ──────────────────────────────────────────────
 
 func TestRedactAuthHeaders_Redacts(t *testing.T) {

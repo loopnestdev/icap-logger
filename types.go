@@ -17,6 +17,7 @@ type Config struct {
 	WriteTimeout     time.Duration
 	HealthPort       string
 	RedactAuthHeader bool // REDACT_AUTH_HEADER env var — default true
+	RedactTokens     bool // REDACT_TOKENS env var — default true
 }
 
 // icapInfo holds parsed information from an ICAP request.

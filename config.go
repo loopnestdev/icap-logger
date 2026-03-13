@@ -20,6 +20,7 @@ func loadConfig() Config {
 		WriteTimeout:     time.Duration(getEnvInt("WRITE_TIMEOUT_SEC", 10)) * time.Second,
 		HealthPort:       getEnv("HEALTH_PORT", "8080"),
 		RedactAuthHeader: getEnvBool("REDACT_AUTH_HEADER", true),
+		RedactTokens:     getEnvBool("REDACT_TOKENS", true),
 	}
 	for _, arg := range os.Args[1:] {
 		switch {

@@ -212,6 +212,11 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 	go func() {
 		info := parseICAP(buf)
 
+		if cfg.RedactTokens {
+			info.reqBody = redactTokenBody(info.reqBody)
+			info.respBody = redactTokenBody(info.respBody)
+		}
+
 		tunneled := info.reqMethod == "CONNECT"
 		reqBody := info.reqBody
 		if tunneled && reqBody == "" {

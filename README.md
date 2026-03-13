@@ -11,7 +11,8 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 - RFC 3507 offset-based encapsulated section parsing (`req-hdr`, `res-hdr`, `req-body`, `res-body`, `null-body`)
 - Non-blocking ICAP message reading — reads complete messages without waiting for EOF (required for Squid compatibility)
 - Chunked HTTP body decoding
-- **Smart body logging** — plain text logged as-is; binary, file uploads, and Base64-encoded file payloads inside JSON replaced with safe metadata summaries
+- **Smart body logging** — plain text logged as-is; binary, file uploads, and Base64-encoded file payloads inside JSON replaced with safe metadata summaries; JSON bodies with non-JSON `Content-Type` headers (e.g. `application/octet-stream`) are content-sniffed so Base64 redaction still applies
+- **Token redaction** — OAuth2/OIDC token values (`access_token`, `refresh_token`, `id_token`, etc.) in JSON response and request bodies are replaced with `[redacted: token]`
 - **Tunnel detection** — `CONNECT` (HTTPS tunnel) requests are flagged with `"tunneled": true` and an explanatory note
 - Millisecond-precision timestamps in local timezone
 - Structured JSON logging to stdout via `log/slog`
@@ -108,6 +109,27 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 }
 ```
 
+### OAuth2 token response (RESPMOD)
+
+```json
+{
+  "timestamp": "2026-03-13T16:13:24.224+11:00",
+  "icap_method": "RESPMOD",
+  "icap_url": "icap://<ICAP_SERVER_IP>:11344/respmod",
+  "req_method": "GET",
+  "req_path": "/oauth2/token",
+  "destination_url": "https://login.microsoftonline.com/oauth2/token",
+  "req_headers": {
+    "Authorization": "[redacted]"
+  },
+  "resp_status": "200 OK",
+  "resp_headers": {
+    "Content-Type": "application/json; charset=utf-8"
+  },
+  "resp_body": "{\"access_token\":\"[redacted: token]\",\"refresh_token\":\"[redacted: token]\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+}
+```
+
 ### Body logging behaviour
 
 | Body type | Example `Content-Type` | Logged as |
@@ -115,6 +137,8 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 | Plain text, JSON, XML, form data | `application/json`, `text/plain` | ✅ Full content |
 | Binary blob (image, PDF, zip, exe) | `image/jpeg`, `application/zip` | `[binary: 8192 bytes]` |
 | JSON field containing Base64-encoded file | `application/json` | `[redacted: base64 payload ~4194488 bytes]` |
+| JSON body with non-JSON Content-Type (e.g. AzCopy, Azure SDK) | `application/octet-stream` | Base64 fields redacted as above (content-sniffed) |
+| OAuth2/OIDC token field in JSON body | `application/json` | `[redacted: token]` |
 | Multipart file upload — file part | `multipart/form-data` | `[file: "report.pdf", content-type: "application/pdf", 204800 bytes]` |
 | Multipart file upload — text field | `multipart/form-data` | `[field: "username" = "alice"]` |
 | Multipart file upload — binary field | `multipart/form-data` | `[field: "data", binary, 1024 bytes]` |
@@ -123,6 +147,10 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 > Binary detection samples the first 512 bytes — if more than 10% are non-printable the body is treated as binary.
 
 > Base64 detection walks every JSON string field and redacts any value longer than 512 chars whose characters are entirely within the Base64 alphabet (standard `+/`, URL-safe `-_`, or MIME-wrapped with `\r\n` line breaks) and that passes a decode probe. The `raw` field value is never printed regardless of the underlying file type.
+
+> Content-sniff fallback: if the declared `Content-Type` is not `application/json` but the body parses as JSON (e.g. `application/octet-stream` from AzCopy / Azure SDKs), Base64 field redaction is still applied.
+
+> Token redaction walks every JSON field whose name equals or ends with `token` (e.g. `access_token`, `refresh_token`, `id_token`, `device_token`, `refreshToken`) and replaces the value with `[redacted: token]`. `token_type` is intentionally preserved. Controlled by `REDACT_TOKENS` (default `true`).
 
 > HTTPS traffic sent through a `CONNECT` tunnel is end-to-end encrypted. No ICAP server can inspect its body without Squid SSL Bump (TLS interception) configured on the proxy.
 
@@ -171,6 +199,7 @@ All settings are configurable via environment variables. CLI flags take preceden
 | `HEALTH_PORT` | `8080` | — | HTTP health check listen port |
 | `TZ` | system default | — | Container timezone (e.g. `Australia/ACT`) |
 | `REDACT_AUTH_HEADER` | `true` | — | Redact `Authorization` and `Proxy-Authorization` header values. Set `false` to log raw values (debug only). |
+| `REDACT_TOKENS` | `true` | — | Redact OAuth2/OIDC token values from JSON bodies. Matches any JSON field whose name ends with `token` (e.g. `access_token`, `refresh_token`, `id_token`, `device_token`). Set `false` to log raw token values (debug only). |
 | `LOG_FILE_RETENTION` | `60` | — | Maximum number of compressed (`.gz`) archive files to retain. When exceeded, the oldest archives are deleted. Set `0` for unlimited. |
 
 ---
@@ -184,9 +213,9 @@ icap-logger/
 ├── server.go           # readICAPMessage(), handleConn(), icapOptionsResponse()
 ├── parser.go           # parseICAP(), splitEncapsulated(), headersToMap()
 ├── logger.go           # rotatingWriter — size-based log rotation (stdlib only)
-├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked()
+├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked(), redactTokenBody()
 ├── types.go            # Config, icapInfo, logEntry struct definitions
-├── main_test.go        # Unit tests (19 tests)
+├── main_test.go        # Unit tests (25 tests)
 ├── go.mod              # Go module — zero external dependencies
 ├── Dockerfile          # Multi-stage hardened Alpine build
 ├── docker-compose.yml  # Full production Compose config
@@ -462,6 +491,14 @@ go tool cover -html=coverage.out
 | `TestDecodeChunked_Empty` | Terminating zero-chunk returns empty string |
 | `TestIsBinary_PlainText` | Plain text not flagged as binary |
 | `TestIsBinary_BinaryData` | Binary data correctly detected |
+| `TestSanitizeBody_OctetStreamJSONBase64Redacted` | JSON+Base64 body with `application/octet-stream` Content-Type is still redacted (content-sniff fallback) |
+| `TestSanitizeBody_EmptyContentTypeJSONBase64Redacted` | JSON+Base64 body with absent Content-Type is redacted |
+| `TestSanitizeBody_TextPlainJSONBase64Redacted` | JSON+Base64 body with `text/plain` Content-Type is redacted via content-sniff |
+| `TestRedactTokenBody_AccessToken` | `access_token` JWT value redacted in RESPMOD body |
+| `TestRedactTokenBody_MultipleTokenFields` | All token fields redacted; `token_type` and `expires_in` preserved |
+| `TestRedactTokenBody_NestedTokenField` | Token field inside nested JSON object is redacted |
+| `TestRedactTokenBody_NotJSON` | Non-JSON body markers pass through unchanged |
+| `TestIsTokenKey` | Key matching rules: ends-with-token matched, `token_type` excluded |
 
 ---
 
@@ -469,6 +506,8 @@ go tool cover -html=coverage.out
 
 - This server **never modifies** content — it always returns `204 No Modifications`
 - **Only plain text payloads are logged in full** — binary data, file uploads, and blobs are replaced with safe metadata summaries
+- **JSON bodies are content-sniffed** — Base64 field redaction applies regardless of the declared `Content-Type` (catches `application/octet-stream` uploads from AzCopy, Azure SDKs, etc.)
+- **OAuth2/OIDC tokens are redacted by default** — any JSON field whose name ends with `token` is replaced with `[redacted: token]` in both request and response bodies; disable with `REDACT_TOKENS=false`
 - `CONNECT` (HTTPS tunnel) requests are logged with `"tunneled": true`; the body is unavailable by design unless Squid SSL Bump is configured
 - Timestamps use millisecond precision in the container's local timezone (`"2026-03-02T17:02:56.123+11:00"`)
 - The ICAP `Date` header sent by Squid is intentionally omitted from `icap_headers` — it is the same moment as the top-level `timestamp` field

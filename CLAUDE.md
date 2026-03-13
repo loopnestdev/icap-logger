@@ -41,7 +41,7 @@ An ICAP (RFC 3507) server written in Go that acts as a logging proxy for Squid.
 | `types.go` | icapInfo, logEntry, Config struct definitions |
 | `server.go` | readICAPMessage(), handleConn(), icapOptionsResponse() |
 | `parser.go` | parseICAP(), splitEncapsulated(), headersToMap() |
-| `body.go` | decodeChunked(), isChunkedBody(), isBinary(), sanitizeBody(), parseMultipartBody() |
+| `body.go` | `decodeChunked()`, `isChunkedBody()`, `isBinary()`, `sanitizeBody()`, `parseMultipartBody()`, `redactTokenBody()`, `isTokenKey()` |
 | `logger.go` | rotatingWriter struct and methods |
 | `main_test.go` | All tests — no _test packages, uses package main |
 
@@ -84,6 +84,23 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
   - MIME-wrapped Base64 (RFC 2045): `\r\n` every 76 chars (Java `getMimeEncoder`, email)
   The Base64 prefix varies by file type (`LS1Z` = multipart `--`, `JVBE` = PDF, `iVBO` = PNG, `UEsD` = ZIP).
   No specific prefix is assumed — the check is alphabet + decode probe only.
+- **Content-sniff JSON fallback** — `sanitizeBody()` tries JSON parsing for ALL Content-Types
+  after the `isBinary()` check. Clients like AzCopy and Azure SDKs declare
+  `application/octet-stream` even when the body is a JSON document. Without this
+  fallback the Base64 field redaction is bypassed entirely.
+  Decision tree:
+  1. Content-Encoding compressed → `[binary: N bytes, content-encoding: X]`
+  2. multipart/* → per-part summary
+  3. application/json or *+json or empty CT → JSON Base64 redaction
+  4. isBinary() → `[binary: N bytes]`
+  5. any remaining body that parses as JSON → JSON Base64 redaction (content-sniff)
+  6. everything else → plain text
+- **Token redaction** — after `sanitizeBody()` and Base64 redaction, if `REDACT_TOKENS=true`
+  `redactTokenBody()` walks the JSON tree again and replaces any string value whose key
+  satisfies `isTokenKey()` with `"[redacted: token]"`. Matching rule: lowercased key equals
+  `token` or ends with `_token` or `token` (camelCase: `refreshToken`, snake: `refresh_token`).
+  `token_type` is intentionally excluded — its value is the harmless string `"Bearer"`.
+  Applied to both `req_body` and `resp_body` in the logging goroutine.
 
 ### Response timing
 
@@ -142,6 +159,20 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
    request. It represents the same moment as the top-level `timestamp`. Fix: `delete()`
    the `Date` key from `icap_headers` after building the map.
 
+9. **Non-JSON Content-Type bypasses Base64 redaction** — AzCopy and Azure SDKs upload JSON
+   bodies with `Content-Type: application/octet-stream`. The explicit JSON branch in
+   `sanitizeBody()` checks `ct == "application/json"` and was skipped, logging the raw 7 MB
+   Base64 string. Fix: add a content-sniff fallback after `isBinary()` that tries
+   `sanitizeJSONBody()` regardless of Content-Type. `sanitizeJSONBody()` returns `""`
+   for non-JSON input so plain text still falls through unchanged.
+
+10. **OAuth2 tokens in response bodies** — Services like Azure Container Registry return
+    `access_token`, `refresh_token`, `id_token` etc. in JSON response bodies (`/oauth2/token`).
+    These are security credentials and must not be logged in full. Fix: `redactTokenBody()`
+    walks the parsed JSON tree and replaces any string value whose key name ends with `token`.
+    Controlled by `REDACT_TOKENS` env var (default `true`). Applied to both `req_body` and
+    `resp_body` in the async logging goroutine after `parseICAP()`.
+
 ---
 
 ## Environment Variables
@@ -158,6 +189,7 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
 | HEALTH_PORT | 8080 | Health check HTTP port |
 | TZ | Australia/ACT | Container timezone |
 | REDACT_AUTH_HEADER | true | Redact Authorization / Proxy-Authorization headers. Set false to log raw values (debug only). |
+| REDACT_TOKENS | true | Redact OAuth2/OIDC token values from JSON response/request bodies. Matches any JSON field whose name equals or ends with `token` (access_token, refresh_token, id_token, device_token, etc.). token_type is intentionally excluded. Set false to log raw token values (debug only). |
 
 ## Log Rotation Behaviour
 
