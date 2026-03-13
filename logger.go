@@ -192,6 +192,10 @@ func compressFile(src, dst string) error {
 // lexicographic order == chronological order), and removes files beyond
 // the fileRetention limit.
 func pruneOldArchives(baseName string, fileRetention int) {
+	// 0 means unlimited — never prune.
+	if fileRetention <= 0 {
+		return
+	}
 	dir := filepath.Dir(baseName)
 	base := filepath.Base(baseName)
 

@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // largeStringThreshold — JSON string values longer than this are checked for
@@ -55,7 +56,18 @@ func isChunkedBody(data []byte) bool {
 	return err == nil
 }
 
-// isBinary returns true if more than 10% of the first 512 bytes are non-printable.
+// isBinary returns true if data appears to be binary rather than human-readable
+// text. Two signals are checked in order:
+//
+//  1. Invalid UTF-8 — valid text (including multi-byte UTF-8 for non-ASCII
+//     languages) is always valid UTF-8. Compressed data (gzip, deflate, brotli)
+//     and raw binary formats almost always contain byte sequences that violate
+//     UTF-8 encoding rules. gzip for example starts with 0x1F 0x8B — the second
+//     byte is a UTF-8 continuation byte with no leading byte, which is invalid.
+//
+//  2. Non-printable ASCII ratio — even for valid UTF-8 content, if more than
+//     10% of the first 512 bytes are ASCII control characters the body is
+//     treated as binary.
 func isBinary(data []byte) bool {
 	sample := data
 	if len(sample) > 512 {
@@ -64,6 +76,13 @@ func isBinary(data []byte) bool {
 	if len(sample) == 0 {
 		return false
 	}
+	// Signal 1: invalid UTF-8 → binary.
+	// This catches gzip, deflate, brotli, JPEG, PNG, ZIP, PDF and any other
+	// format whose bytes don't form valid UTF-8 sequences.
+	if !utf8.Valid(sample) {
+		return true
+	}
+	// Signal 2: high density of ASCII control characters.
 	nonPrintable := 0
 	for _, b := range sample {
 		if b < 0x09 || (b > 0x0d && b < 0x20) || b == 0x7f {
@@ -212,15 +231,38 @@ func parseMultipartBody(body, boundary string) string {
 	return strings.Join(parts, "; ")
 }
 
+// isCompressedEncoding returns true when the HTTP Content-Encoding header
+// indicates the body has been compressed at the transport layer.
+// Such bodies are always binary after ICAP chunked-decoding and must never
+// be logged as text regardless of Content-Type.
+func isCompressedEncoding(contentEncoding string) bool {
+	for _, token := range strings.Split(contentEncoding, ",") {
+		switch strings.TrimSpace(strings.ToLower(token)) {
+		case "gzip", "x-gzip", "deflate", "br", "zstd", "compress", "x-compress":
+			return true
+		}
+	}
+	return false
+}
+
 // sanitizeBody inspects a decoded body string and returns a safe log-friendly
 // representation:
-//   - multipart/form-data          → per-part summary
-//   - application/json             → JSON with Base64 fields redacted
-//   - binary content               → [binary: N bytes]
-//   - plain text                   → returned as-is
-func sanitizeBody(body, contentType string) string {
+//   - compressed (Content-Encoding: gzip/deflate/br/zstd) → [binary: N bytes, content-encoding: X]
+//   - multipart/form-data                                  → per-part summary
+//   - application/json                                     → JSON with Base64 fields redacted
+//   - binary content (invalid UTF-8 or high control-char density) → [binary: N bytes]
+//   - plain text                                           → returned as-is
+func sanitizeBody(body, contentType, contentEncoding string) string {
 	if body == "" {
 		return ""
+	}
+
+	// ── Content-Encoding fast path ─────────────────────────────────────────────
+	// If the HTTP client compressed the body, the ICAP payload bytes are raw
+	// compressed data — definitively binary, never human-readable.
+	if isCompressedEncoding(contentEncoding) {
+		ce := strings.TrimSpace(strings.ToLower(contentEncoding))
+		return fmt.Sprintf("[binary: %d bytes, content-encoding: %s]", len(body), ce)
 	}
 
 	ct := ""

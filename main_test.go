@@ -379,7 +379,7 @@ func TestSanitizeBody_JSONBase64FieldRedacted(t *testing.T) {
 
 	body := `{"sys_id":"abc123","snow_id":"def456","last_update":1773208633000,"raw":"` + encoded + `"}`
 
-	got := sanitizeBody(body, "application/json")
+	got := sanitizeBody(body, "application/json", "")
 
 	if strings.Contains(got, encoded[:50]) {
 		t.Fatalf("Base64 payload must be redacted, got raw base64 in: %.200s", got)
@@ -395,16 +395,101 @@ func TestSanitizeBody_JSONBase64FieldRedacted(t *testing.T) {
 
 func TestSanitizeBody_JSONNonBase64Preserved(t *testing.T) {
 	body := `{"key":"value","number":42,"nested":{"a":"b"}}`
-	got := sanitizeBody(body, "application/json")
+	got := sanitizeBody(body, "application/json", "")
 	if !strings.Contains(got, "value") {
 		t.Fatalf("non-base64 JSON fields must be preserved, got: %s", got)
 	}
 }
 
 func TestSanitizeBody_JSONEmptyBody(t *testing.T) {
-	got := sanitizeBody("", "application/json")
+	got := sanitizeBody("", "application/json", "")
 	if got != "" {
 		t.Errorf("empty body should return empty, got %q", got)
+	}
+}
+
+// ── Content-Encoding / compressed body tests ──────────────────────────────────
+
+func TestSanitizeBody_GzipContentEncoding(t *testing.T) {
+	// Reproduce the exact production case: git client sends a gzip-compressed
+	// body with Content-Encoding: gzip. The body bytes are raw gzip and must
+	// never be logged as text.
+	gzipMagic := string([]byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03}) +
+		strings.Repeat("x", 200)
+	got := sanitizeBody(gzipMagic, "application/x-git-upload-pack-request", "gzip")
+	if !strings.HasPrefix(got, "[binary:") {
+		t.Errorf("gzip body must be redacted, got: %q", got)
+	}
+	if !strings.Contains(got, "content-encoding: gzip") {
+		t.Errorf("redaction marker must mention encoding, got: %q", got)
+	}
+}
+
+func TestSanitizeBody_BrContentEncoding(t *testing.T) {
+	body := strings.Repeat("brotli compressed", 20)
+	got := sanitizeBody(body, "text/html", "br")
+	if !strings.HasPrefix(got, "[binary:") {
+		t.Errorf("br-encoded body must be redacted, got: %q", got)
+	}
+}
+
+func TestSanitizeBody_MultipleEncodings(t *testing.T) {
+	// Content-Encoding can be a comma-separated list, e.g. "gzip, identity"
+	body := strings.Repeat("data", 50)
+	got := sanitizeBody(body, "application/octet-stream", "gzip, identity")
+	if !strings.HasPrefix(got, "[binary:") {
+		t.Errorf("multi-value content-encoding with gzip must be redacted, got: %q", got)
+	}
+}
+
+func TestSanitizeBody_NoContentEncoding(t *testing.T) {
+	// Empty/absent Content-Encoding must not suppress normal JSON parsing.
+	body := `{"key":"value"}`
+	got := sanitizeBody(body, "application/json", "")
+	if !strings.Contains(got, "value") {
+		t.Errorf("plain JSON with no content-encoding must be logged, got: %q", got)
+	}
+}
+
+func TestIsBinary_GzipBytes(t *testing.T) {
+	// gzip magic: 0x1F 0x8B — 0x8B is a UTF-8 continuation byte without a
+	// leading byte, making the sequence invalid UTF-8. isBinary must catch this.
+	gzipHeader := []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03}
+	gzipBody := append(gzipHeader, []byte(strings.Repeat("abcdefgh", 60))...)
+	if !isBinary(gzipBody) {
+		t.Error("gzip bytes must be detected as binary via utf8.Valid check")
+	}
+}
+
+func TestIsBinary_UTF8NonASCIIText(t *testing.T) {
+	// Valid UTF-8 text with non-ASCII characters (Chinese) must NOT be binary.
+	text := strings.Repeat("你好世界 Hello World\n", 30)
+	if isBinary([]byte(text)) {
+		t.Error("valid UTF-8 non-ASCII text must not be flagged as binary")
+	}
+}
+
+func TestIsCompressedEncoding(t *testing.T) {
+	cases := []struct {
+		ce   string
+		want bool
+	}{
+		{"gzip", true},
+		{"x-gzip", true},
+		{"deflate", true},
+		{"br", true},
+		{"zstd", true},
+		{"compress", true},
+		{"GZIP", true},          // case-insensitive
+		{"gzip, identity", true}, // comma-separated
+		{"identity", false},
+		{"", false},
+		{"chunked", false},
+	}
+	for _, c := range cases {
+		if got := isCompressedEncoding(c.ce); got != c.want {
+			t.Errorf("isCompressedEncoding(%q) = %v, want %v", c.ce, got, c.want)
+		}
 	}
 }
 
@@ -503,8 +588,14 @@ func TestRotatingWriter_RotatesOnSizeThreshold(t *testing.T) {
 	w.maxSize = 10 // 10 bytes
 	w.mu.Unlock()
 
-	// Write enough to trigger rotation.
-	payload := []byte("hello world!") // 12 bytes > 10
+	// Write a first chunk so size > 0 (rotation requires size > 0 to prevent
+	// triggering on the very first write to a fresh empty file).
+	if _, err := w.Write([]byte("hi")); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+
+	// Second write pushes total (2 + 12 = 14) over maxSize (10) → rotation fires.
+	payload := []byte("hello world!") // 12 bytes; 2+12=14 > 10
 	if _, err := w.Write(payload); err != nil {
 		t.Fatalf("Write: %v", err)
 	}

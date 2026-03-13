@@ -96,20 +96,24 @@ func parseICAP(raw []byte) icapInfo {
 	if bodyBytes, ok := sections["req-body"]; ok && len(bodyBytes) > 0 {
 		decoded := decodeChunked(bodyBytes)
 		ct := ""
+		ce := ""
 		if info.reqHeaders != nil {
 			ct = info.reqHeaders.Get("Content-Type")
+			ce = info.reqHeaders.Get("Content-Encoding")
 		}
-		info.reqBody = sanitizeBody(decoded, ct)
+		info.reqBody = sanitizeBody(decoded, ct, ce)
 	}
 
 	// --- res-body ---
 	if bodyBytes, ok := sections["res-body"]; ok && len(bodyBytes) > 0 {
 		decoded := decodeChunked(bodyBytes)
 		ct := ""
+		ce := ""
 		if info.respHeaders != nil {
 			ct = info.respHeaders.Get("Content-Type")
+			ce = info.respHeaders.Get("Content-Encoding")
 		}
-		info.respBody = sanitizeBody(decoded, ct)
+		info.respBody = sanitizeBody(decoded, ct, ce)
 	}
 
 	return info
