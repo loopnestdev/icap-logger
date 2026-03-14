@@ -217,7 +217,7 @@ icap-logger/
 ├── logger.go           # rotatingWriter — size-based log rotation (stdlib only)
 ├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked(), redactTokenBody()
 ├── types.go            # Config, icapInfo, logEntry struct definitions
-├── main_test.go        # Unit tests (33 tests)
+├── main_test.go        # Unit tests (70 tests)
 ├── go.mod              # Go module — zero external dependencies
 ├── Dockerfile          # Multi-stage hardened Alpine build
 ├── docker-compose.yml  # Full production Compose config
@@ -509,12 +509,20 @@ go tool cover -html=coverage.out
 | `TestSelectBodies_TunneledMarkerDisabled` | `CONNECT` + `LOG_REQ_BODY=false` — empty body returned |
 | `TestSelectBodies_TokenRedactionApplied` | Token redaction fires when body logging enabled |
 | `TestSelectBodies_TokenRedactionSkippedWhenBodyDisabled` | Token redaction skipped entirely when body logging disabled |
+| `TestAllow204_Present` | `Allow: 204, trailers` → `allow204` returns true (CONNECT case) |
+| `TestAllow204_Absent` | `Allow: trailers` (no 204) → `allow204` returns false (PUT case) |
+| `TestAllow204_NoHeader` | No Allow header → `allow204` returns false |
+| `TestAllow204_CaseInsensitive` | `ALLOW:` header name is matched case-insensitively |
+| `TestAllow204_NoPartialMatch` | `Allow: 2048` does not match `204` token |
+| `TestBuildICAPEchoResponse_ReqMod` | PUT with body: echoes req headers + chunked body in `200 OK` |
+| `TestBuildICAPEchoResponse_NullBody` | GET with null-body: echoes headers in `200 OK` |
+| `TestBuildICAPEchoResponse_Malformed` | Malformed input returns a safe `200 OK` fallback without panicking |
 
 ---
 
 ## Notes
 
-- This server **never modifies** content — it always returns `204 No Modifications`
+- This server returns `204 No Modifications` only when the ICAP client advertises `Allow: 204` in the request (RFC 3507 §4.6). When `Allow: 204` is absent (e.g. when icap-logger is second in a Squid `adaptation_service_chain`), it echoes the original content with `200 OK`.
 - **Only plain text payloads are logged in full** — binary data, file uploads, and blobs are replaced with safe metadata summaries
 - **JSON bodies are content-sniffed** — Base64 field redaction applies regardless of the declared `Content-Type` (catches `application/octet-stream` uploads from AzCopy, Azure SDKs, etc.)
 - **OAuth2/OIDC tokens are redacted by default** — any JSON field whose name ends with `token` is replaced with `[redacted: token]` in both request and response bodies; disable with `REDACT_TOKENS=false`

@@ -661,6 +661,127 @@ func TestIsTokenKey(t *testing.T) {
 	}
 }
 
+// ── allow204 unit tests ───────────────────────────────────────────────────────
+
+func TestAllow204_Present(t *testing.T) {
+	// Exact CONNECT case from production: Allow: 204, trailers
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"Allow: 204, trailers\r\nEncapsulated: null-body=0\r\n",
+		"",
+	)
+	if !allow204(raw) {
+		t.Error("expected allow204=true when Allow header contains 204 token")
+	}
+}
+
+func TestAllow204_Absent(t *testing.T) {
+	// Exact PUT case from production: Allow: trailers (no 204 token)
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"Allow: trailers\r\nEncapsulated: req-body=0\r\n",
+		"",
+	)
+	if allow204(raw) {
+		t.Error("expected allow204=false when Allow header does not contain 204 token")
+	}
+}
+
+func TestAllow204_NoHeader(t *testing.T) {
+	// No Allow header at all
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"Encapsulated: req-body=0\r\n",
+		"",
+	)
+	if allow204(raw) {
+		t.Error("expected allow204=false when no Allow header present")
+	}
+}
+
+func TestAllow204_CaseInsensitive(t *testing.T) {
+	// Header name casing must not matter
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"ALLOW: 204, trailers\r\nEncapsulated: null-body=0\r\n",
+		"",
+	)
+	if !allow204(raw) {
+		t.Error("expected allow204=true for ALLOW header with 204 token (case-insensitive)")
+	}
+}
+
+func TestAllow204_NoPartialMatch(t *testing.T) {
+	// "2048" must NOT match the "204" token
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"Allow: 2048, trailers\r\nEncapsulated: null-body=0\r\n",
+		"",
+	)
+	if allow204(raw) {
+		t.Error("expected allow204=false: '2048' must not match '204' token")
+	}
+}
+
+// ── buildICAPEchoResponse unit tests ─────────────────────────────────────────
+
+func TestBuildICAPEchoResponse_ReqMod(t *testing.T) {
+	// Simulate the exact production PUT case: Allow: trailers, no 204
+	httpHdr := "PUT /blob HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\n"
+	chunkedBody := "5\r\nhello\r\n0\r\n\r\n"
+	encHeader := "req-hdr=0, req-body=" + itoa(len(httpHdr))
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
+		httpHdr+chunkedBody,
+	)
+	resp := buildICAPEchoResponse(raw)
+	respStr := string(resp)
+
+	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
+		t.Errorf("response must start with ICAP/1.0 200 OK, got: %.80s", respStr)
+	}
+	if !strings.Contains(respStr, "Encapsulated: "+encHeader) {
+		t.Errorf("response must preserve Encapsulated header value, got: %.200s", respStr)
+	}
+	if !strings.Contains(respStr, httpHdr) {
+		t.Error("response must echo the original HTTP request headers")
+	}
+	if !strings.Contains(respStr, chunkedBody) {
+		t.Error("response must echo the original chunked body")
+	}
+}
+
+func TestBuildICAPEchoResponse_NullBody(t *testing.T) {
+	httpHdr := "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	encHeader := "req-hdr=0, null-body=" + itoa(len(httpHdr))
+	raw := buildICAP(
+		"REQMOD icap://localhost/reqmod ICAP/1.0",
+		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
+		httpHdr,
+	)
+	resp := buildICAPEchoResponse(raw)
+	respStr := string(resp)
+
+	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
+		t.Errorf("response must start with ICAP/1.0 200 OK, got: %.80s", respStr)
+	}
+	if !strings.Contains(respStr, "Encapsulated: "+encHeader) {
+		t.Errorf("expected Encapsulated header preserved, got: %.200s", respStr)
+	}
+	if !strings.Contains(respStr, httpHdr) {
+		t.Error("response must echo the HTTP headers")
+	}
+}
+
+func TestBuildICAPEchoResponse_Malformed(t *testing.T) {
+	// No \r\n\r\n boundary — must return a safe fallback response, not panic.
+	resp := buildICAPEchoResponse([]byte("REQMOD icap://localhost ICAP/1.0\r\nAllow: trailers"))
+	if !strings.HasPrefix(string(resp), "ICAP/1.0 200 OK") {
+		t.Errorf("malformed input must return a safe 200 OK response, got: %q", resp)
+	}
+}
+
 // ── selectBodies unit tests ───────────────────────────────────────────────────
 
 func TestSelectBodies_BothDisabled(t *testing.T) {

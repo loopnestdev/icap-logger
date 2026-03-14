@@ -19,6 +19,7 @@ coverage.out
 # Log files
 logs/
 *.log
+*.txt
 
 # macOS
 .DS_Store

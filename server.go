@@ -160,8 +160,91 @@ func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// allow204 reports whether the ICAP request permits a "204 No Modifications"
+// response.  RFC 3507 §4.6 prohibits sending 204 unless the ICAP client's
+// Allow header explicitly carries the "204" token.
+//
+// In a service chain (e.g. SquidClamav → icap-logger), Squid strips the
+// Allow: 204 token from the forwarded request when the upstream ICAP service
+// returned 200 OK with the full body — signalling that subsequent services
+// must echo the content back, not short-circuit with 204.
+func allow204(buf []byte) bool {
+	reader := bufio.NewReader(bytes.NewReader(buf))
+	reader.ReadString('\n') // skip the ICAP request line
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || err != nil {
+			break
+		}
+		if idx := strings.IndexByte(trimmed, ':'); idx != -1 {
+			if strings.EqualFold(strings.TrimSpace(trimmed[:idx]), "Allow") {
+				val := strings.TrimSpace(trimmed[idx+1:])
+				for _, token := range strings.Split(val, ",") {
+					if strings.TrimSpace(token) == "204" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// buildICAPEchoResponse constructs an ICAP/1.0 200 OK response that echoes
+// the encapsulated HTTP section from the request buffer back to Squid unchanged.
+//
+// This is required when the ICAP client did not advertise Allow: 204 (RFC 3507
+// §4.6).  The server must not send 204 in that case, so it returns 200 OK with
+// the original request/response headers and body so the chain can continue
+// forwarding to the upstream server.
+//
+// The Encapsulated header offset values are preserved verbatim because the
+// encapsulated section bytes are echoed in the same order and at the same
+// relative offsets as they arrived.
+func buildICAPEchoResponse(buf []byte) []byte {
+	// Extract the Encapsulated header value from the ICAP request headers.
+	encapsulatedVal := ""
+	reader := bufio.NewReader(bytes.NewReader(buf))
+	reader.ReadString('\n') // skip the ICAP request line
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || err != nil {
+			break
+		}
+		if idx := strings.IndexByte(trimmed, ':'); idx != -1 {
+			if strings.EqualFold(strings.TrimSpace(trimmed[:idx]), "Encapsulated") {
+				encapsulatedVal = strings.TrimSpace(trimmed[idx+1:])
+			}
+		}
+	}
+
+	// Locate the end of the ICAP headers — the first \r\n\r\n boundary.
+	// Everything after it is the encapsulated HTTP content to echo back.
+	sep := []byte("\r\n\r\n")
+	icapHdrEnd := bytes.Index(buf, sep)
+	if icapHdrEnd < 0 {
+		// Malformed request — return a safe minimal response.
+		return []byte("ICAP/1.0 200 OK\r\nConnection: close\r\nEncapsulated: null-body=0\r\n\r\n")
+	}
+	encapsulatedSection := buf[icapHdrEnd+len(sep):]
+
+	if encapsulatedVal == "" {
+		encapsulatedVal = "null-body=0"
+	}
+
+	var resp bytes.Buffer
+	resp.WriteString("ICAP/1.0 200 OK\r\n")
+	resp.WriteString("Connection: close\r\n")
+	resp.WriteString("Encapsulated: " + encapsulatedVal + "\r\n")
+	resp.WriteString("\r\n")
+	resp.Write(encapsulatedSection)
+	return resp.Bytes()
+}
+
 // handleConn reads one complete ICAP request, parses it, writes a structured
-// JSON log entry, and responds with 204 No Modifications.
+// JSON log entry, and responds appropriately.
 // OPTIONS requests are handled immediately and never logged.
 func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 	defer conn.Close()
@@ -192,15 +275,24 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 		return
 	}
 
-	// ── Send 204 FIRST before any logging/marshaling ──────────────────────────
-	// Critical: Squid/C-ICAP has a short response deadline. For large payloads
-	// (e.g. 4MB file uploads), JSON marshaling + file I/O can exceed that
-	// deadline causing ERR_ICAP_FAILURE 500 on the client side.
+	// ── Respond: 204 if the client permits it; 200 OK echo otherwise ───────────
+	// RFC 3507 §4.6: a 204 response is ONLY legal when the ICAP request's
+	// Allow header contains the token "204".  In a service chain, Squid strips
+	// Allow: 204 after ClamAV returns 200 OK with the full body — signalling
+	// that subsequent chain members must echo the content rather than
+	// short-circuit.  Sending 204 without Allow: 204 causes Squid to return
+	// ERR_ICAP_FAILURE (Cache-Status: detail=mismatch) to the client.
 	if err := conn.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout)); err != nil {
 		slog.Warn("failed to set write deadline", "err", err)
 		return
 	}
-	if _, err := conn.Write([]byte("ICAP/1.0 204 No Modifications\r\nConnection: close\r\n\r\n")); err != nil {
+	var icapResp []byte
+	if allow204(buf) {
+		icapResp = []byte("ICAP/1.0 204 No Modifications\r\nConnection: close\r\n\r\n")
+	} else {
+		icapResp = buildICAPEchoResponse(buf)
+	}
+	if _, err := conn.Write(icapResp); err != nil {
 		logger.Println(`{"error":"failed to write ICAP response"}`)
 		return
 	}

@@ -173,17 +173,25 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
     Controlled by `REDACT_TOKENS` env var (default `true`). Applied to both `req_body` and
     `resp_body` in the async logging goroutine after `parseICAP()`.
 
-11. **`Transfer-Complete: *` causes `ERR_ICAP_FAILURE detail=mismatch` in a chained setup** —
-    When icap-logger is chained after ClamAV (`adaptation_service_chain`), advertising
-    `Transfer-Complete: *` and `Preview: 0` in the OPTIONS response instructs Squid to
-    deliver the entire body before icap-logger may respond. Squid then validates ISTag
-    consistency across the chain. Because ClamAV returns a `200 OK` (body re-encapsulated)
-    and icap-logger returns `204 No Modifications`, Squid detects a mismatch between the
-    chain state and returns `ERR_ICAP_FAILURE 0` (`Cache-Status: detail=mismatch`) to the
-    client. File uploads (PUT/POST with large bodies) are the primary trigger.
-    Fix: remove `Transfer-Complete: *`, `Preview: 0`, and `Transfer-Ignore` from the OPTIONS
-    response entirely. Without these headers Squid does not attempt body pre-delivery
-    negotiation for icap-logger and the `204` is accepted unconditionally.
+11. **Unconditional `204` in a service chain causes `ERR_ICAP_FAILURE detail=mismatch`** —
+    RFC 3507 §4.6: an ICAP server MUST NOT respond with `204 No Modifications` unless the
+    ICAP client's request included an `Allow` header containing the token `204`.
+    In a service chain (SquidClamav → icap-logger), Squid strips `Allow: 204` from the
+    forwarded request when ClamAV returned `200 OK` with the full body (i.e. for any large
+    body upload that required a full scan). This signals to downstream services: "you must
+    echo the content back; you cannot short-circuit". If icap-logger still responds `204`,
+    Squid detects an illegal response and returns `ERR_ICAP_FAILURE 0`
+    (`Cache-Status: detail=mismatch`) to the client.
+    Observed pattern:
+    - Small/null-body requests (GET, CONNECT): Squid sends `Allow: 204, trailers` → `204` is legal
+    - Large body uploads (PUT/POST ≥1MB): Squid sends `Allow: trailers` (no `204`) → `204` is ILLEGAL
+    Fix: `allow204(buf)` scans the incoming ICAP request's `Allow` header before responding.
+    If `204` is absent, `buildICAPEchoResponse(buf)` constructs a `200 OK` response that
+    echoes the original encapsulated HTTP headers and body verbatim back to Squid.
+    The Encapsulated header offset values are preserved unchanged because the bytes are echoed
+    in the same order.
+    Note: `Transfer-Complete: *` and `Preview: 0` were also removed from the OPTIONS response
+    as a precaution (they add unnecessary protocol overhead), but were NOT the root cause.
 
 ---
 
