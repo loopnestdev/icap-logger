@@ -211,17 +211,7 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 	// ── Log asynchronously so we never block the ICAP response path ──────────
 	go func() {
 		info := parseICAP(buf)
-
-		if cfg.RedactTokens {
-			info.reqBody = redactTokenBody(info.reqBody)
-			info.respBody = redactTokenBody(info.respBody)
-		}
-
-		tunneled := info.reqMethod == "CONNECT"
-		reqBody := info.reqBody
-		if tunneled && reqBody == "" {
-			reqBody = "tunneled"
-		}
+		reqBody, respBody := selectBodies(info, cfg)
 
 		const tsFormat = "2006-01-02T15:04:05.000Z07:00"
 		entry := logEntry{
@@ -231,10 +221,10 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 			ReqMethod:      info.reqMethod,
 			ReqPath:        info.reqPath,
 			DestinationURL: info.destinationURL,
-			Tunneled:       tunneled,
+			Tunneled:       info.reqMethod == "CONNECT",
 			ReqBody:        reqBody,
 			RespStatus:     info.respStatus,
-			RespBody:       info.respBody,
+			RespBody:       respBody,
 		}
 
 		if len(info.icapHeaders) > 0 {
