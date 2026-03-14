@@ -23,6 +23,12 @@ services:
       - HEALTH_PORT=8080
       # Set to false to log Authorization headers (e.g. during debug sessions)
       - REDACT_AUTH_HEADER=true
+      # Set to false to log raw OAuth2/OIDC token values (debug only)
+      - REDACT_TOKENS=true
+      # Set to true to include req_body in log entries (default: false)
+      - LOG_REQ_BODY=false
+      # Set to true to include resp_body in log entries (default: false)
+      - LOG_RESP_BODY=false
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
       interval: 30s

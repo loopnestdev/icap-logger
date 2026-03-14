@@ -190,6 +190,8 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
 | TZ | Australia/ACT | Container timezone |
 | REDACT_AUTH_HEADER | true | Redact Authorization / Proxy-Authorization headers. Set false to log raw values (debug only). |
 | REDACT_TOKENS | true | Redact OAuth2/OIDC token values from JSON response/request bodies. Matches any JSON field whose name equals or ends with `token` (access_token, refresh_token, id_token, device_token, etc.). token_type is intentionally excluded. Set false to log raw token values (debug only). |
+| LOG_REQ_BODY | false | Include req_body in log entries. Default false — request bodies are suppressed entirely. Set true to log request body (Base64 redaction and token redaction still apply). |
+| LOG_RESP_BODY | false | Include resp_body in log entries. Default false — response bodies are suppressed entirely. Set true to log response body (Base64 redaction and token redaction still apply). |
 
 ## Log Rotation Behaviour
 

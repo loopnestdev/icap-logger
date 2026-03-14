@@ -200,6 +200,8 @@ All settings are configurable via environment variables. CLI flags take preceden
 | `TZ` | system default | — | Container timezone (e.g. `Australia/ACT`) |
 | `REDACT_AUTH_HEADER` | `true` | — | Redact `Authorization` and `Proxy-Authorization` header values. Set `false` to log raw values (debug only). |
 | `REDACT_TOKENS` | `true` | — | Redact OAuth2/OIDC token values from JSON bodies. Matches any JSON field whose name ends with `token` (e.g. `access_token`, `refresh_token`, `id_token`, `device_token`). Set `false` to log raw token values (debug only). |
+| `LOG_REQ_BODY` | `false` | — | Include `req_body` in log entries. Default `false` — request bodies are suppressed. Set `true` to log request body content (Base64 sanitization and `REDACT_TOKENS` still apply). |
+| `LOG_RESP_BODY` | `false` | — | Include `resp_body` in log entries. Default `false` — response bodies are suppressed. Set `true` to log response body content (Base64 sanitization and `REDACT_TOKENS` still apply). |
 | `LOG_FILE_RETENTION` | `60` | — | Maximum number of compressed (`.gz`) archive files to retain. When exceeded, the oldest archives are deleted. Set `0` for unlimited. |
 
 ---
@@ -215,7 +217,7 @@ icap-logger/
 ├── logger.go           # rotatingWriter — size-based log rotation (stdlib only)
 ├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked(), redactTokenBody()
 ├── types.go            # Config, icapInfo, logEntry struct definitions
-├── main_test.go        # Unit tests (25 tests)
+├── main_test.go        # Unit tests (33 tests)
 ├── go.mod              # Go module — zero external dependencies
 ├── Dockerfile          # Multi-stage hardened Alpine build
 ├── docker-compose.yml  # Full production Compose config
@@ -499,6 +501,14 @@ go tool cover -html=coverage.out
 | `TestRedactTokenBody_NestedTokenField` | Token field inside nested JSON object is redacted |
 | `TestRedactTokenBody_NotJSON` | Non-JSON body markers pass through unchanged |
 | `TestIsTokenKey` | Key matching rules: ends-with-token matched, `token_type` excluded |
+| `TestSelectBodies_BothDisabled` | Default config — both bodies empty (not logged) |
+| `TestSelectBodies_ReqBodyEnabled` | `LOG_REQ_BODY=true` — req body logged, resp body suppressed |
+| `TestSelectBodies_RespBodyEnabled` | `LOG_RESP_BODY=true` — resp body logged, req body suppressed |
+| `TestSelectBodies_BothEnabled` | Both flags true — both bodies logged |
+| `TestSelectBodies_TunneledMarkerSet` | `CONNECT` + `LOG_REQ_BODY=true` — tunneled marker set |
+| `TestSelectBodies_TunneledMarkerDisabled` | `CONNECT` + `LOG_REQ_BODY=false` — empty body returned |
+| `TestSelectBodies_TokenRedactionApplied` | Token redaction fires when body logging enabled |
+| `TestSelectBodies_TokenRedactionSkippedWhenBodyDisabled` | Token redaction skipped entirely when body logging disabled |
 
 ---
 

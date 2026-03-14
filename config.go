@@ -21,6 +21,8 @@ func loadConfig() Config {
 		HealthPort:       getEnv("HEALTH_PORT", "8080"),
 		RedactAuthHeader: getEnvBool("REDACT_AUTH_HEADER", true),
 		RedactTokens:     getEnvBool("REDACT_TOKENS", true),
+		LogReqBody:       getEnvBool("LOG_REQ_BODY", false),
+		LogRespBody:      getEnvBool("LOG_RESP_BODY", false),
 	}
 	for _, arg := range os.Args[1:] {
 		switch {

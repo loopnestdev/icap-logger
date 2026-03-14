@@ -661,6 +661,102 @@ func TestIsTokenKey(t *testing.T) {
 	}
 }
 
+// ── selectBodies unit tests ───────────────────────────────────────────────────
+
+func TestSelectBodies_BothDisabled(t *testing.T) {
+	// Default config (false/false) — neither body must appear in the log entry.
+	info := icapInfo{reqBody: "sensitive request data", respBody: "sensitive response data"}
+	cfg := Config{LogReqBody: false, LogRespBody: false}
+	req, resp := selectBodies(info, cfg)
+	if req != "" {
+		t.Errorf("req body must be empty when LogReqBody=false, got %q", req)
+	}
+	if resp != "" {
+		t.Errorf("resp body must be empty when LogRespBody=false, got %q", resp)
+	}
+}
+
+func TestSelectBodies_ReqBodyEnabled(t *testing.T) {
+	info := icapInfo{reqBody: "hello", respBody: "world"}
+	cfg := Config{LogReqBody: true, LogRespBody: false}
+	req, resp := selectBodies(info, cfg)
+	if req != "hello" {
+		t.Errorf("expected req=hello, got %q", req)
+	}
+	if resp != "" {
+		t.Errorf("resp must be empty when LogRespBody=false, got %q", resp)
+	}
+}
+
+func TestSelectBodies_RespBodyEnabled(t *testing.T) {
+	info := icapInfo{reqBody: "hello", respBody: "world"}
+	cfg := Config{LogReqBody: false, LogRespBody: true}
+	req, resp := selectBodies(info, cfg)
+	if req != "" {
+		t.Errorf("req must be empty when LogReqBody=false, got %q", req)
+	}
+	if resp != "world" {
+		t.Errorf("expected resp=world, got %q", resp)
+	}
+}
+
+func TestSelectBodies_BothEnabled(t *testing.T) {
+	info := icapInfo{reqBody: "hello", respBody: "world"}
+	cfg := Config{LogReqBody: true, LogRespBody: true}
+	req, resp := selectBodies(info, cfg)
+	if req != "hello" {
+		t.Errorf("expected req=hello, got %q", req)
+	}
+	if resp != "world" {
+		t.Errorf("expected resp=world, got %q", resp)
+	}
+}
+
+func TestSelectBodies_TunneledMarkerSet(t *testing.T) {
+	// CONNECT with LogReqBody=true and no body → must produce the tunneled marker.
+	info := icapInfo{reqMethod: "CONNECT", reqBody: ""}
+	cfg := Config{LogReqBody: true, LogRespBody: false}
+	req, _ := selectBodies(info, cfg)
+	const want = "[tunneled: HTTPS traffic, body not inspectable]"
+	if req != want {
+		t.Errorf("CONNECT with LogReqBody=true must set tunneled marker, got %q", req)
+	}
+}
+
+func TestSelectBodies_TunneledMarkerDisabled(t *testing.T) {
+	// CONNECT with LogReqBody=false → req body must be empty (marker suppressed).
+	info := icapInfo{reqMethod: "CONNECT", reqBody: ""}
+	cfg := Config{LogReqBody: false, LogRespBody: false}
+	req, _ := selectBodies(info, cfg)
+	if req != "" {
+		t.Errorf("CONNECT with LogReqBody=false must return empty body, got %q", req)
+	}
+}
+
+func TestSelectBodies_TokenRedactionApplied(t *testing.T) {
+	// Token redaction must fire when LogReqBody=true and RedactTokens=true.
+	info := icapInfo{reqBody: `{"access_token":"eyJsecretToken"}`, respBody: ""}
+	cfg := Config{LogReqBody: true, LogRespBody: false, RedactTokens: true}
+	req, _ := selectBodies(info, cfg)
+	if strings.Contains(req, "eyJsecretToken") {
+		t.Errorf("access_token value must be redacted, got %q", req)
+	}
+	if !strings.Contains(req, "[redacted: token]") {
+		t.Errorf("expected [redacted: token] marker, got %q", req)
+	}
+}
+
+func TestSelectBodies_TokenRedactionSkippedWhenBodyDisabled(t *testing.T) {
+	// When LogReqBody=false the body must be empty — redactTokenBody must not
+	// even be called (the body is never processed or logged).
+	info := icapInfo{reqBody: `{"access_token":"eyJsecretToken"}`, respBody: ""}
+	cfg := Config{LogReqBody: false, LogRespBody: false, RedactTokens: true}
+	req, _ := selectBodies(info, cfg)
+	if req != "" {
+		t.Errorf("req body must be empty when LogReqBody=false, got %q", req)
+	}
+}
+
 // ── redactAuthHeaders unit tests ──────────────────────────────────────────────
 
 func TestRedactAuthHeaders_Redacts(t *testing.T) {

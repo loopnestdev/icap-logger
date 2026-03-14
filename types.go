@@ -18,6 +18,8 @@ type Config struct {
 	HealthPort       string
 	RedactAuthHeader bool // REDACT_AUTH_HEADER env var — default true
 	RedactTokens     bool // REDACT_TOKENS env var — default true
+	LogReqBody       bool // LOG_REQ_BODY env var — default false
+	LogRespBody      bool // LOG_RESP_BODY env var — default false
 }
 
 // icapInfo holds parsed information from an ICAP request.

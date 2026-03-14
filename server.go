@@ -268,6 +268,33 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 	}()
 }
 
+// selectBodies returns the req and resp body strings that should appear in the
+// log entry, respecting the LogReqBody / LogRespBody flags and applying token
+// redaction only for bodies that will actually be logged.
+//
+//   - cfg.LogReqBody=false (default) → reqBody is always ""
+//   - cfg.LogRespBody=false (default) → respBody is always ""
+//   - CONNECT (HTTPS tunnel) requests receive the standard tunneled marker
+//     only when LogReqBody is true and the parsed body is empty.
+func selectBodies(info icapInfo, cfg Config) (reqBody, respBody string) {
+	if cfg.LogReqBody {
+		reqBody = info.reqBody
+		if cfg.RedactTokens {
+			reqBody = redactTokenBody(reqBody)
+		}
+		if info.reqMethod == "CONNECT" && reqBody == "" {
+			reqBody = "[tunneled: HTTPS traffic, body not inspectable]"
+		}
+	}
+	if cfg.LogRespBody {
+		respBody = info.respBody
+		if cfg.RedactTokens {
+			respBody = redactTokenBody(respBody)
+		}
+	}
+	return
+}
+
 // redactAuthHeaders replaces the value of any Authorization or
 // Proxy-Authorization header with "[redacted]".
 func redactAuthHeaders(headers map[string]string) {
