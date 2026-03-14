@@ -30,7 +30,7 @@ A **production-ready ICAP (Internet Content Adaptation Protocol) server** writte
 
 1. Listens on TCP port `11344` (configurable via `ICAP_PORT`) for incoming connections
 2. Reads one complete ICAP message without waiting for EOF — critical for Squid which holds connections open
-3. Answers `OPTIONS` probes immediately so Squid marks the service as up
+3. Answers `OPTIONS` probes immediately so Squid marks the service as up. The OPTIONS response deliberately omits `Transfer-Complete` and `Preview` — advertising these in a chained setup (icap-logger after ClamAV) causes Squid to enforce ISTag consistency across the chain and return `ERR_ICAP_FAILURE detail=mismatch` on large body uploads
 4. Parses `REQMOD` / `RESPMOD` using RFC 3507 byte offsets from the `Encapsulated` header
 5. Extracts ICAP headers, encapsulated HTTP request/response headers, and chunked body
 6. Sends `ICAP/1.0 204 No Modifications` immediately after reading the message — before any parsing or I/O — so large payloads never delay the response and cause client timeouts

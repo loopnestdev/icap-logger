@@ -31,9 +31,6 @@ func icapOptionsResponse(serviceURL string) string {
 		"Max-Connections: 100",
 		"Options-TTL: 3600",
 		"Allow: 204",
-		"Preview: 0",
-		"Transfer-Complete: *",
-		"Transfer-Ignore: jpg,jpeg,gif,png,swf,flv,mp3,mp4,avi,mkv,zip,gz,tar,iso",
 		"Connection: close",
 		"\r\n",
 	}, "\r\n")

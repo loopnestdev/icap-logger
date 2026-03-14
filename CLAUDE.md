@@ -173,6 +173,18 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
     Controlled by `REDACT_TOKENS` env var (default `true`). Applied to both `req_body` and
     `resp_body` in the async logging goroutine after `parseICAP()`.
 
+11. **`Transfer-Complete: *` causes `ERR_ICAP_FAILURE detail=mismatch` in a chained setup** —
+    When icap-logger is chained after ClamAV (`adaptation_service_chain`), advertising
+    `Transfer-Complete: *` and `Preview: 0` in the OPTIONS response instructs Squid to
+    deliver the entire body before icap-logger may respond. Squid then validates ISTag
+    consistency across the chain. Because ClamAV returns a `200 OK` (body re-encapsulated)
+    and icap-logger returns `204 No Modifications`, Squid detects a mismatch between the
+    chain state and returns `ERR_ICAP_FAILURE 0` (`Cache-Status: detail=mismatch`) to the
+    client. File uploads (PUT/POST with large bodies) are the primary trigger.
+    Fix: remove `Transfer-Complete: *`, `Preview: 0`, and `Transfer-Ignore` from the OPTIONS
+    response entirely. Without these headers Squid does not attempt body pre-delivery
+    negotiation for icap-logger and the `204` is accepted unconditionally.
+
 ---
 
 ## Environment Variables
