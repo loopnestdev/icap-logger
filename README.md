@@ -217,7 +217,7 @@ icap-logger/
 ├── logger.go           # rotatingWriter — size-based log rotation (stdlib only)
 ├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked(), redactTokenBody()
 ├── types.go            # Config, icapInfo, logEntry struct definitions
-├── main_test.go        # Unit tests (70 tests)
+├── main_test.go        # Unit tests (75 tests)
 ├── go.mod              # Go module — zero external dependencies
 ├── Dockerfile          # Multi-stage hardened Alpine build
 ├── docker-compose.yml  # Full production Compose config
@@ -517,6 +517,11 @@ go tool cover -html=coverage.out
 | `TestBuildICAPEchoResponse_ReqMod` | PUT with body: echoes req headers + chunked body in `200 OK` |
 | `TestBuildICAPEchoResponse_NullBody` | GET with null-body: echoes headers in `200 OK` |
 | `TestBuildICAPEchoResponse_Malformed` | Malformed input returns a safe `200 OK` fallback without panicking |
+| `TestBuildICAPEchoResponse_RespMod` | RESPMOD with body: echoes only `res-hdr` + `res-body`; `req-hdr` is stripped (RFC 3507 §4.9.2) |
+| `TestBuildICAPEchoResponse_RespMod_NullBody` | RESPMOD with null-body: echoes only `res-hdr`; `req-hdr` stripped |
+| `TestTrimReqHdrSection_WithBody` | Offset adjustment correct when res-body is present |
+| `TestTrimReqHdrSection_NullBody` | Offset adjustment correct when null-body is present |
+| `TestTrimReqHdrSection_NoResHdr` | No res-hdr in section — returns original values unchanged, no panic |
 
 ---
 

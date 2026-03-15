@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -779,6 +780,118 @@ func TestBuildICAPEchoResponse_Malformed(t *testing.T) {
 	resp := buildICAPEchoResponse([]byte("REQMOD icap://localhost ICAP/1.0\r\nAllow: trailers"))
 	if !strings.HasPrefix(string(resp), "ICAP/1.0 200 OK") {
 		t.Errorf("malformed input must return a safe 200 OK response, got: %q", resp)
+	}
+}
+
+func TestBuildICAPEchoResponse_RespMod(t *testing.T) {
+	// Production RESPMOD case: Allow: trailers (no 204), req-hdr + res-hdr + res-body.
+	// The echo response must NOT include req-hdr — RFC 3507 §4.9.2.
+	reqHdr := "GET /file.gz HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	resHdr := "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: 5\r\n\r\n"
+	chunkedBody := "5\r\nhello\r\n0\r\n\r\n"
+	resHdrOff := len(reqHdr)
+	resBodyOff := resHdrOff + len(resHdr)
+	encHeader := fmt.Sprintf("req-hdr=0, res-hdr=%d, res-body=%d", resHdrOff, resBodyOff)
+
+	raw := buildICAP(
+		"RESPMOD icap://localhost/respmod ICAP/1.0",
+		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
+		reqHdr+resHdr+chunkedBody,
+	)
+	resp := buildICAPEchoResponse(raw)
+	respStr := string(resp)
+
+	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
+		t.Errorf("response must start with ICAP/1.0 200 OK, got: %.80s", respStr)
+	}
+	// Encapsulated must be res-hdr=0, res-body=<len(resHdr)>
+	wantEnc := fmt.Sprintf("Encapsulated: res-hdr=0, res-body=%d", len(resHdr))
+	if !strings.Contains(respStr, wantEnc) {
+		t.Errorf("expected %q in response, got: %.300s", wantEnc, respStr)
+	}
+	// Must NOT include the HTTP request headers
+	if strings.Contains(respStr, "GET /file.gz") {
+		t.Error("RESPMOD echo must not include the original HTTP request headers (req-hdr)")
+	}
+	// Must include the HTTP response headers and body
+	if !strings.Contains(respStr, resHdr) {
+		t.Error("response must echo the HTTP response headers")
+	}
+	if !strings.Contains(respStr, chunkedBody) {
+		t.Error("response must echo the chunked body")
+	}
+}
+
+func TestBuildICAPEchoResponse_RespMod_NullBody(t *testing.T) {
+	// RESPMOD with null-body (HEAD request or redirect — no response body).
+	reqHdr := "HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	resHdr := "HTTP/1.1 302 Found\r\nLocation: /new\r\n\r\n"
+	resHdrOff := len(reqHdr)
+	nullBodyOff := resHdrOff + len(resHdr)
+	encHeader := fmt.Sprintf("req-hdr=0, res-hdr=%d, null-body=%d", resHdrOff, nullBodyOff)
+
+	raw := buildICAP(
+		"RESPMOD icap://localhost/respmod ICAP/1.0",
+		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
+		reqHdr+resHdr,
+	)
+	resp := buildICAPEchoResponse(raw)
+	respStr := string(resp)
+
+	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
+		t.Errorf("response must start with ICAP/1.0 200 OK, got: %.80s", respStr)
+	}
+	wantEnc := fmt.Sprintf("Encapsulated: res-hdr=0, null-body=%d", len(resHdr))
+	if !strings.Contains(respStr, wantEnc) {
+		t.Errorf("expected %q in response, got: %.300s", wantEnc, respStr)
+	}
+	if strings.Contains(respStr, "HEAD /") {
+		t.Error("RESPMOD echo must not include the original HTTP request headers")
+	}
+}
+
+func TestTrimReqHdrSection_WithBody(t *testing.T) {
+	reqHdr := "GET / HTTP/1.1\r\nHost: x\r\n\r\n" // 26 bytes
+	resHdr := "HTTP/1.1 200 OK\r\n\r\n"           // 19 bytes
+	body := "5\r\nhello\r\n0\r\n\r\n"
+	section := []byte(reqHdr + resHdr + body)
+	encVal := fmt.Sprintf("req-hdr=0, res-hdr=%d, res-body=%d", len(reqHdr), len(reqHdr)+len(resHdr))
+
+	gotEnc, gotSec := trimReqHdrSection(encVal, section)
+
+	wantEnc := fmt.Sprintf("res-hdr=0, res-body=%d", len(resHdr))
+	if gotEnc != wantEnc {
+		t.Errorf("encVal: want %q, got %q", wantEnc, gotEnc)
+	}
+	if string(gotSec) != resHdr+body {
+		t.Errorf("section: want res-hdr+body, got %q", gotSec)
+	}
+}
+
+func TestTrimReqHdrSection_NullBody(t *testing.T) {
+	reqHdr := "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n" // 27 bytes
+	resHdr := "HTTP/1.1 200 OK\r\n\r\n"            // 19 bytes
+	section := []byte(reqHdr + resHdr)
+	encVal := fmt.Sprintf("req-hdr=0, res-hdr=%d, null-body=%d", len(reqHdr), len(reqHdr)+len(resHdr))
+
+	gotEnc, gotSec := trimReqHdrSection(encVal, section)
+
+	wantEnc := fmt.Sprintf("res-hdr=0, null-body=%d", len(resHdr))
+	if gotEnc != wantEnc {
+		t.Errorf("encVal: want %q, got %q", wantEnc, gotEnc)
+	}
+	if string(gotSec) != resHdr {
+		t.Errorf("section: want resHdr only, got %q", gotSec)
+	}
+}
+
+func TestTrimReqHdrSection_NoResHdr(t *testing.T) {
+	// If there's no res-hdr (shouldn't happen for RESPMOD, but must not panic).
+	section := []byte("some bytes")
+	encVal := "req-hdr=0, null-body=10"
+	gotEnc, gotSec := trimReqHdrSection(encVal, section)
+	if gotEnc != encVal || string(gotSec) != "some bytes" {
+		t.Error("no res-hdr: should return original encVal and section unchanged")
 	}
 }
 

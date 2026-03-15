@@ -203,10 +203,14 @@ func allow204(buf []byte) bool {
 // encapsulated section bytes are echoed in the same order and at the same
 // relative offsets as they arrived.
 func buildICAPEchoResponse(buf []byte) []byte {
-	// Extract the Encapsulated header value from the ICAP request headers.
+	// Parse the ICAP method (first line) and Encapsulated header.
+	isRespMod := false
 	encapsulatedVal := ""
 	reader := bufio.NewReader(bytes.NewReader(buf))
-	reader.ReadString('\n') // skip the ICAP request line
+	firstLine, _ := reader.ReadString('\n')
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(firstLine)), "RESPMOD ") {
+		isRespMod = true
+	}
 	for {
 		line, err := reader.ReadString('\n')
 		trimmed := strings.TrimSpace(line)
@@ -234,6 +238,14 @@ func buildICAPEchoResponse(buf []byte) []byte {
 		encapsulatedVal = "null-body=0"
 	}
 
+	// RFC 3507 §4.9.2: A RESPMOD 200 OK response MUST contain only the HTTP
+	// response (res-hdr + res-body/null-body) — NOT the original req-hdr.
+	// Squid treats a RESPMOD echo that includes req-hdr as malformed and closes
+	// the connection, producing ERR_ICAP_FAILURE detail=mismatch.
+	if isRespMod {
+		encapsulatedVal, encapsulatedSection = trimReqHdrSection(encapsulatedVal, encapsulatedSection)
+	}
+
 	var resp bytes.Buffer
 	resp.WriteString("ICAP/1.0 200 OK\r\n")
 	resp.WriteString("Connection: close\r\n")
@@ -241,6 +253,52 @@ func buildICAPEchoResponse(buf []byte) []byte {
 	resp.WriteString("\r\n")
 	resp.Write(encapsulatedSection)
 	return resp.Bytes()
+}
+
+// trimReqHdrSection strips the req-hdr bytes from the encapsulated section and
+// adjusts the Encapsulated header value for a RESPMOD 200 OK echo response.
+// RFC 3507 §4.9.2 allows only res-hdr and res-body/null-body in the response.
+func trimReqHdrSection(encVal string, section []byte) (newEncVal string, newSection []byte) {
+	resHdrOffset := int64(-1)
+	resBodyOffset := int64(-1)
+	hasNullBody := false
+
+	for _, part := range strings.Split(encVal, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val, err := strconv.ParseInt(strings.TrimSpace(kv[1]), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "res-hdr":
+			resHdrOffset = val
+		case "res-body":
+			resBodyOffset = val
+		case "null-body":
+			resBodyOffset = val
+			hasNullBody = true
+		}
+	}
+
+	if resHdrOffset < 0 || resHdrOffset > int64(len(section)) {
+		// No res-hdr present or offset out of bounds — return unchanged.
+		return encVal, section
+	}
+
+	newSection = section[resHdrOffset:]
+	if resBodyOffset >= 0 {
+		bodyOff := resBodyOffset - resHdrOffset
+		if hasNullBody {
+			return fmt.Sprintf("res-hdr=0, null-body=%d", bodyOff), newSection
+		}
+		return fmt.Sprintf("res-hdr=0, res-body=%d", bodyOff), newSection
+	}
+	// No body section found — safe fallback.
+	return encVal, section
 }
 
 // handleConn reads one complete ICAP request, parses it, writes a structured
