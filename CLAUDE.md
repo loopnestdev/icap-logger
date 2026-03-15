@@ -38,11 +38,11 @@ An ICAP (RFC 3507) server written in Go that acts as a logging proxy for Squid.
 |---|---|
 | `main.go` | Entry point only: loadConfig, signal handling, listener, health server |
 | `config.go` | Config struct, loadConfig(), getEnv(), getEnvInt(), CLI flag parsing |
-| `types.go` | icapInfo, logEntry, Config struct definitions |
-| `server.go` | readICAPMessage(), handleConn(), icapOptionsResponse() |
+| `types.go` | icapInfo, icapMeta, logEntry, Config struct definitions |
+| `server.go` | readICAPMessage(), handleConn(), icapOptionsResponse(), allow204(), buildICAPEchoResponse(), trimReqHdrSection(), selectBodies() |
 | `parser.go` | parseICAP(), splitEncapsulated(), headersToMap() |
-| `body.go` | `decodeChunked()`, `isChunkedBody()`, `isBinary()`, `sanitizeBody()`, `parseMultipartBody()`, `redactTokenBody()`, `isTokenKey()` |
-| `logger.go` | rotatingWriter struct and methods |
+| `body.go` | `decodeChunked()`, `isChunkedBody()`, `isBinary()`, `sanitizeBody()`, `parseMultipartBody()`, `redactTokenBody()`, `isTokenKey()`, `sanitizeJSONBody()` |
+| `logger.go` | rotatingWriter struct and methods, startLogWriter() |
 | `main_test.go` | All tests — no _test packages, uses package main |
 
 ---
@@ -95,19 +95,33 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
   4. isBinary() → `[binary: N bytes]`
   5. any remaining body that parses as JSON → JSON Base64 redaction (content-sniff)
   6. everything else → plain text
-- **Token redaction** — after `sanitizeBody()` and Base64 redaction, if `REDACT_TOKENS=true`
-  `redactTokenBody()` walks the JSON tree again and replaces any string value whose key
-  satisfies `isTokenKey()` with `"[redacted: token]"`. Matching rule: lowercased key equals
-  `token` or ends with `_token` or `token` (camelCase: `refreshToken`, snake: `refresh_token`).
+- **Token redaction** — controlled by the `redactTokens bool` parameter passed to `sanitizeBody()`
+  and forwarded to `sanitizeJSONBody()`. Both Base64-field redaction and token-key redaction
+  happen in a **single** `json.Unmarshal → walk → json.Marshal` pass — no second parse.
+  Matching rule: lowercased key equals `token` or ends with `_token` or `token` (camelCase: `refreshToken`, snake: `refresh_token`).
   `token_type` is intentionally excluded — its value is the harmless string `"Bearer"`.
-  Applied to both `req_body` and `resp_body` in the logging goroutine.
+  When `LOG_REQ_BODY=false` / `LOG_RESP_BODY=false` (the default), `sanitizeBody` is never
+  called for that body at all — zero work done.
+  Decision tree (implemented in `sanitizeBody()`):
+  1. Content-Encoding compressed → `[binary: N bytes, content-encoding: X]`
+  2. multipart/* → per-part summary
+  3. isBinary() → `[binary: N bytes]`
+  4. sanitizeJSONBody(body, redactTokens) — tries JSON parse for ANY Content-Type:
+     - on success: applies Base64 redaction + token redaction in one walk → returns sanitized JSON
+     - on failure (not JSON): returns `""`
+  5. everything else → plain text as-is
 
-### Response timing
-
-- `204 No Modifications` is sent **immediately** after `readICAPMessage()` returns,
+- `allow204` flag, `isRespMod`, `encapsulated` value, and ICAP header byte length are all
+  captured **during the single `readICAPMessage()` pass** and stored in `icapMeta`.
+  `allow204(meta)` and `buildICAPEchoResponse(buf, meta)` are O(1) lookups — no second scan
+  of the buffer before the response write.
+- The ICAP response (`204` or `200 OK` echo) is sent **immediately** after `readICAPMessage()` returns,
   before `parseICAP()`, `json.Marshal()`, or any file I/O.
 - All logging runs in a `go func()` goroutine so large payloads (e.g. 4 MB file uploads)
   never delay the ICAP response and cause `ERR_ICAP_FAILURE` on the client.
+- Log entries are sent as pre-serialised `[]byte` on a `chan<- []byte` (capacity 512).
+  A single dedicated goroutine (`startLogWriter`) drains the channel and writes to
+  `rotatingWriter` — one mutex acquisition per write, no `log.Logger` alloc overhead.
 
 ### Date header
 
@@ -185,13 +199,24 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
     Observed pattern:
     - Small/null-body requests (GET, CONNECT): Squid sends `Allow: 204, trailers` → `204` is legal
     - Large body uploads (PUT/POST ≥1MB): Squid sends `Allow: trailers` (no `204`) → `204` is ILLEGAL
-    Fix: `allow204(buf)` scans the incoming ICAP request's `Allow` header before responding.
-    If `204` is absent, `buildICAPEchoResponse(buf)` constructs a `200 OK` response that
+    Fix: `allow204` flag is pre-computed during `readICAPMessage()` and stored in `icapMeta`.
+    If `204` is absent, `buildICAPEchoResponse(buf, meta)` constructs a `200 OK` response that
     echoes the original encapsulated HTTP headers and body verbatim back to Squid.
     The Encapsulated header offset values are preserved unchanged because the bytes are echoed
-    in the same order.
+    in the same order. `icapMeta.icapHdrLen` is used to locate the encapsulated section without
+    a second `bytes.Index` scan.
     Note: `Transfer-Complete: *` and `Preview: 0` were also removed from the OPTIONS response
     as a precaution (they add unnecessary protocol overhead), but were NOT the root cause.
+
+12. **RESPMOD echo must not include `req-hdr`** — RFC 3507 §4.9.2 specifies that a RESPMOD
+    `200 OK` response must contain only the HTTP response section (`res-hdr` + `res-body` or
+    `null-body`). The original HTTP request headers (`req-hdr`) that Squid includes in a
+    RESPMOD request for context MUST NOT be echoed back. If they are, Squid treats the response
+    as malformed, closes the TCP connection mid-write, and produces `ERR_ICAP_FAILURE`
+    ("failed to write ICAP response" in icap-logger logs).
+    Fix: `buildICAPEchoResponse` detects RESPMOD via `icapMeta.isRespMod` and calls
+    `trimReqHdrSection()`, which slices the encapsulated section starting at the `res-hdr`
+    offset and recalculates the `Encapsulated:` header value (`res-hdr=0, res-body=N`).
 
 ---
 
@@ -232,7 +257,9 @@ The null-body key is SKIPPED in the parts slice — it carries no bytes.
 ## Test Strategy
 
 - All tests in main_test.go (package main)
-- buildICAP() helper constructs raw ICAP bytes for unit tests
+- `buildICAP()` helper constructs raw ICAP bytes for unit tests
+- `parseICAPMeta()` helper feeds raw bytes through `readICAPMessage()` and returns `icapMeta`;
+  tolerates `io.EOF` (normal when reading from a fixed buffer, not a TCP connection)
 - Every parser code path has a test — especially the null-body case
-- Tests use itoa() helper to avoid strconv import
+- Tests use `itoa()` helper to avoid strconv import
 - Run: `go test ./... -v -race -coverprofile=coverage.out`

@@ -8,7 +8,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -31,7 +30,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	icapLogger := log.New(logWriter, "", 0)
+	icapLogger := startLogWriter(logWriter)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -90,6 +89,8 @@ func main() {
 	defer cancel()
 	_ = healthSrv.Shutdown(shutdownCtx)
 
+	// Close the log channel — the writer goroutine will drain it then exit.
+	close(icapLogger)
 	_ = logWriter.Close()
 	slog.Info("shutdown complete")
 }

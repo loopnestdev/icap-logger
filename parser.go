@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -101,7 +102,7 @@ func parseICAP(raw []byte) icapInfo {
 			ct = info.reqHeaders.Get("Content-Type")
 			ce = info.reqHeaders.Get("Content-Encoding")
 		}
-		info.reqBody = sanitizeBody(decoded, ct, ce)
+		info.reqBody = sanitizeBody(decoded, ct, ce, false)
 	}
 
 	// --- res-body ---
@@ -113,7 +114,7 @@ func parseICAP(raw []byte) icapInfo {
 			ct = info.respHeaders.Get("Content-Type")
 			ce = info.respHeaders.Get("Content-Encoding")
 		}
-		info.respBody = sanitizeBody(decoded, ct, ce)
+		info.respBody = sanitizeBody(decoded, ct, ce, false)
 	}
 
 	return info
@@ -151,8 +152,10 @@ func splitEncapsulated(data []byte, encHeader string) map[string][]byte {
 		if name == "null-body" {
 			continue
 		}
-		offset := 0
-		fmt.Sscanf(strings.TrimSpace(kv[1]), "%d", &offset)
+		offset, err := strconv.Atoi(strings.TrimSpace(kv[1]))
+		if err != nil {
+			continue
+		}
 		parts = append(parts, part{name, offset})
 	}
 
@@ -168,20 +171,23 @@ func splitEncapsulated(data []byte, encHeader string) map[string][]byte {
 		if end > len(data) {
 			end = len(data)
 		}
-		buf := make([]byte, end-start)
-		copy(buf, data[start:end])
-		sections[p.name] = buf
+		// Sub-slice without copying — callers treat sections as read-only.
+		sections[p.name] = data[start:end]
 	}
 
 	return sections
 }
 
-// headersToMap converts http.Header to a flat map[string]string,
-// joining multiple values with ", ".
+// headersToMap converts http.Header to a flat map[string]string.
+// Single-value headers (the common case) avoid the strings.Join allocation.
 func headersToMap(h http.Header) map[string]string {
 	m := make(map[string]string, len(h))
 	for k, vs := range h {
-		m[k] = strings.Join(vs, ", ")
+		if len(vs) == 1 {
+			m[k] = vs[0]
+		} else {
+			m[k] = strings.Join(vs, ", ")
+		}
 	}
 	return m
 }

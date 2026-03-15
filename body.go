@@ -109,15 +109,19 @@ func looksLikeBase64(s string) bool {
 	}
 
 	// Strip MIME line-wrap whitespace (\r\n) to support MIME-wrapped Base64.
-	// Only strip if the non-whitespace portion is still long enough.
-	stripped := strings.Map(func(r rune) rune {
-		if r == '\r' || r == '\n' {
-			return -1
+	// Only allocate a new string when line-wrap characters are actually present
+	// (the common case for non-MIME-wrapped Base64 avoids the allocation entirely).
+	stripped := s
+	if strings.ContainsAny(s, "\r\n") {
+		stripped = strings.Map(func(r rune) rune {
+			if r == '\r' || r == '\n' {
+				return -1
+			}
+			return r
+		}, s)
+		if len(stripped) < largeStringThreshold {
+			return false
 		}
-		return r
-	}, s)
-	if len(stripped) < largeStringThreshold {
-		return false
 	}
 
 	// Detect which Base64 alphabet is in use and pick the right decoder.
@@ -185,14 +189,18 @@ func redactJSONLargeStrings(v any) any {
 }
 
 // sanitizeJSONBody parses a JSON body, redacts large Base64 string fields,
-// and re-serializes. Returns the original body if parsing fails.
-func sanitizeJSONBody(body string) string {
+// optionally redacts token fields, and re-serializes.
+// Returns "" if parsing fails (not valid JSON).
+func sanitizeJSONBody(body string, redactTokens bool) string {
 	var v any
 	if err := json.Unmarshal([]byte(body), &v); err != nil {
 		// Not valid JSON — fall through to binary/text check
 		return ""
 	}
 	v = redactJSONLargeStrings(v)
+	if redactTokens {
+		v = redactTokenFields(v)
+	}
 	out, err := json.Marshal(v)
 	if err != nil {
 		return body
@@ -249,13 +257,15 @@ func isCompressedEncoding(contentEncoding string) bool {
 // representation:
 //   - compressed (Content-Encoding: gzip/deflate/br/zstd) → [binary: N bytes, content-encoding: X]
 //   - multipart/form-data                                  → per-part summary
-//   - application/json (or +json)                          → JSON with Base64 fields redacted
+//   - application/json (or +json)                          → JSON with Base64 + token fields redacted
 //   - binary content (invalid UTF-8 or high control-char density) → [binary: N bytes]
-//   - any other non-binary body that parses as JSON        → JSON with Base64 fields redacted
+//   - any other non-binary body that parses as JSON        → JSON with Base64 + token fields redacted
 //     (content-sniff fallback — catches application/octet-stream uploads, e.g.
 //     AzCopy / Azure SDK, that carry a JSON body but declare a non-JSON Content-Type)
 //   - plain text                                           → returned as-is
-func sanitizeBody(body, contentType, contentEncoding string) string {
+//
+// redactTokens controls whether JSON token fields are redacted in the same pass.
+func sanitizeBody(body, contentType, contentEncoding string, redactTokens bool) string {
 	if body == "" {
 		return ""
 	}
@@ -285,28 +295,20 @@ func sanitizeBody(body, contentType, contentEncoding string) string {
 		}
 	}
 
-	// ── JSON — walk and redact Base64 string fields ────────────────────────────
-	if ct == "application/json" || strings.HasSuffix(ct, "+json") || ct == "" {
-		if sanitized := sanitizeJSONBody(body); sanitized != "" {
-			return sanitized
-		}
-		// sanitizeJSONBody returns "" only when Unmarshal fails → fall through
-	}
-
 	// ── binary blob ────────────────────────────────────────────────────────────
 	if isBinary([]byte(body)) {
 		return fmt.Sprintf("[binary: %d bytes]", len(body))
 	}
 
-	// ── content-sniff: JSON with Base64 fields in a non-JSON Content-Type ────────
-	// Handles uploads where the HTTP client declares application/octet-stream (or
-	// any other non-JSON type) but the body is actually a JSON document containing
-	// large Base64-encoded fields.  sanitizeJSONBody returns "" for non-JSON input
-	// so plain-text bodies fall through unchanged.
-	if sanitized := sanitizeJSONBody(body); sanitized != "" {
+	// ── JSON (declared or content-sniffed) ─────────────────────────────────────
+	// Applies to: application/json, *+json, empty CT, or any CT where the body
+	// actually parses as JSON (content-sniff for AzCopy octet-stream etc.).
+	// Both Base64-field and token redaction happen in a single unmarshal/marshal pass.
+	if sanitized := sanitizeJSONBody(body, redactTokens); sanitized != "" {
 		return sanitized
 	}
 
+	// Plain text — return as-is.
 	return body
 }
 

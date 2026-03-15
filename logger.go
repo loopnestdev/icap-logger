@@ -95,6 +95,8 @@ func (w *rotatingWriter) rotate() error {
 
 // Write implements io.Writer. It rotates the file when the size threshold is
 // reached, then writes p to the active file.
+// A newline is appended if p does not already end with one so each log entry
+// occupies exactly one line (matching the behaviour of log.Logger.Println).
 func (w *rotatingWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -106,6 +108,14 @@ func (w *rotatingWriter) Write(p []byte) (n int, err error) {
 	}
 	n, err = w.file.Write(p)
 	w.size += int64(n)
+	if err == nil && (len(p) == 0 || p[len(p)-1] != '\n') {
+		nl := []byte{'\n'}
+		nn, nerr := w.file.Write(nl)
+		w.size += int64(nn)
+		if nerr != nil {
+			return n, nerr
+		}
+	}
 	return n, err
 }
 
@@ -117,6 +127,28 @@ func (w *rotatingWriter) Close() error {
 		return w.file.Close()
 	}
 	return nil
+}
+
+// startLogWriter starts a single dedicated goroutine that drains logCh and
+// writes each pre-serialised JSON line to w.  This eliminates the double-mutex
+// acquisition that occurred when log.Logger (internal mutex) wrapped
+// rotatingWriter (its own mutex), and removes the log.Logger fmt.Appendf
+// allocation from every goroutine's hot path.
+//
+// The returned channel is unbuffered from the caller's perspective — callers
+// should send on it inside their own goroutine (which they already do for
+// async logging).  The channel is closed by the caller (main) on shutdown,
+// which causes the writer goroutine to drain and exit cleanly.
+func startLogWriter(w *rotatingWriter) chan<- []byte {
+	ch := make(chan []byte, 512) // 512-entry buffer absorbs bursts without blocking goroutines
+	go func() {
+		for data := range ch {
+			if _, err := w.Write(data); err != nil {
+				slog.Error("log write error", "err", err)
+			}
+		}
+	}()
+	return ch
 }
 
 // ── background helpers ────────────────────────────────────────────────────────

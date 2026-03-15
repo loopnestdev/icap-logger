@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"strconv"
@@ -48,35 +47,59 @@ func icapOptionsResponse(serviceURL string) string {
 //     is no chunked body section, not that req-hdr is absent.
 //  3. Read chunked body (req-body / res-body) until "0\r\n\r\n".
 //     Skipped when null-body is present.
-func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, error) {
+//
+// It also fills an icapMeta so the caller can call allow204 and
+// buildICAPEchoResponse without re-scanning the returned buffer.
+func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, icapMeta, error) {
 	var buf bytes.Buffer
 	var total int64
+	var meta icapMeta
 
 	// ── Step 1: ICAP request line + ICAP headers ─────────────────────────────
 	encapsulatedVal := ""
+	firstLine := true
 	for {
 		line, err := r.ReadString('\n')
 		total += int64(len(line))
 		if total > maxSize {
-			return buf.Bytes(), fmt.Errorf("ICAP message exceeds max size")
+			return buf.Bytes(), meta, fmt.Errorf("ICAP message exceeds max size")
 		}
 		buf.WriteString(line)
 		if err != nil {
-			return buf.Bytes(), err
+			return buf.Bytes(), meta, err
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		if trimmed == "" {
 			break // blank line = end of ICAP headers
 		}
+		if firstLine {
+			firstLine = false
+			upper := strings.ToUpper(trimmed)
+			meta.isRespMod = strings.HasPrefix(upper, "RESPMOD ")
+		}
 		lower := strings.ToLower(trimmed)
 		if strings.HasPrefix(lower, "encapsulated:") {
-			encapsulatedVal = lower
+			encapsulatedVal = strings.TrimSpace(trimmed[len("encapsulated:"):])
+			meta.encapsulated = encapsulatedVal
+			// keep lower-cased copy for contains checks below
+			encapsulatedVal = strings.ToLower(encapsulatedVal)
+		} else if strings.HasPrefix(lower, "allow:") {
+			// Scan the Allow value for the "204" token inline — no second pass needed.
+			val := strings.TrimSpace(trimmed[len("allow:"):])
+			for _, token := range strings.Split(val, ",") {
+				if strings.TrimSpace(token) == "204" {
+					meta.allow204 = true
+					break
+				}
+			}
 		}
 	}
+	// Record the byte length of the ICAP header block (including \r\n\r\n).
+	meta.icapHdrLen = buf.Len()
 
 	// Nothing encapsulated at all — done (e.g. bare OPTIONS).
 	if encapsulatedVal == "" {
-		return buf.Bytes(), nil
+		return buf.Bytes(), meta, nil
 	}
 
 	// ── Step 2: encapsulated HTTP request headers (req-hdr) ──────────────────
@@ -87,11 +110,11 @@ func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, error) {
 			line, err := r.ReadString('\n')
 			total += int64(len(line))
 			if total > maxSize {
-				return buf.Bytes(), fmt.Errorf("ICAP message exceeds max size")
+				return buf.Bytes(), meta, fmt.Errorf("ICAP message exceeds max size")
 			}
 			buf.WriteString(line)
 			if err != nil {
-				return buf.Bytes(), err
+				return buf.Bytes(), meta, err
 			}
 			if strings.TrimRight(line, "\r\n") == "" {
 				break // blank line = end of HTTP request headers
@@ -105,11 +128,11 @@ func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, error) {
 			line, err := r.ReadString('\n')
 			total += int64(len(line))
 			if total > maxSize {
-				return buf.Bytes(), fmt.Errorf("ICAP message exceeds max size")
+				return buf.Bytes(), meta, fmt.Errorf("ICAP message exceeds max size")
 			}
 			buf.WriteString(line)
 			if err != nil {
-				return buf.Bytes(), err
+				return buf.Bytes(), meta, err
 			}
 			if strings.TrimRight(line, "\r\n") == "" {
 				break // blank line = end of HTTP response headers
@@ -129,7 +152,7 @@ func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, error) {
 			total += int64(len(sizeLine))
 			buf.WriteString(sizeLine)
 			if err != nil {
-				return buf.Bytes(), err
+				return buf.Bytes(), meta, err
 			}
 			sizeStr := strings.TrimSpace(sizeLine)
 			// Strip chunk extensions: "5;ext=val" → "5"
@@ -157,38 +180,14 @@ func readICAPMessage(r *bufio.Reader, maxSize int64) ([]byte, error) {
 		}
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes(), meta, nil
 }
 
 // allow204 reports whether the ICAP request permits a "204 No Modifications"
-// response.  RFC 3507 §4.6 prohibits sending 204 unless the ICAP client's
-// Allow header explicitly carries the "204" token.
-//
-// In a service chain (e.g. SquidClamav → icap-logger), Squid strips the
-// Allow: 204 token from the forwarded request when the upstream ICAP service
-// returned 200 OK with the full body — signalling that subsequent services
-// must echo the content back, not short-circuit with 204.
-func allow204(buf []byte) bool {
-	reader := bufio.NewReader(bytes.NewReader(buf))
-	reader.ReadString('\n') // skip the ICAP request line
-	for {
-		line, err := reader.ReadString('\n')
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || err != nil {
-			break
-		}
-		if idx := strings.IndexByte(trimmed, ':'); idx != -1 {
-			if strings.EqualFold(strings.TrimSpace(trimmed[:idx]), "Allow") {
-				val := strings.TrimSpace(trimmed[idx+1:])
-				for _, token := range strings.Split(val, ",") {
-					if strings.TrimSpace(token) == "204" {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
+// response per RFC 3507 §4.6.  The result is pre-computed during
+// readICAPMessage so this is now a zero-allocation O(1) lookup.
+func allow204(meta icapMeta) bool {
+	return meta.allow204
 }
 
 // buildICAPEchoResponse constructs an ICAP/1.0 200 OK response that echoes
@@ -199,40 +198,18 @@ func allow204(buf []byte) bool {
 // the original request/response headers and body so the chain can continue
 // forwarding to the upstream server.
 //
-// The Encapsulated header offset values are preserved verbatim because the
-// encapsulated section bytes are echoed in the same order and at the same
-// relative offsets as they arrived.
-func buildICAPEchoResponse(buf []byte) []byte {
-	// Parse the ICAP method (first line) and Encapsulated header.
-	isRespMod := false
-	encapsulatedVal := ""
-	reader := bufio.NewReader(bytes.NewReader(buf))
-	firstLine, _ := reader.ReadString('\n')
-	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(firstLine)), "RESPMOD ") {
-		isRespMod = true
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || err != nil {
-			break
-		}
-		if idx := strings.IndexByte(trimmed, ':'); idx != -1 {
-			if strings.EqualFold(strings.TrimSpace(trimmed[:idx]), "Encapsulated") {
-				encapsulatedVal = strings.TrimSpace(trimmed[idx+1:])
-			}
-		}
-	}
+// meta carries the Encapsulated header value and ICAP-header byte length that
+// were already extracted during readICAPMessage — no re-scan of buf is needed.
+func buildICAPEchoResponse(buf []byte, meta icapMeta) []byte {
+	encapsulatedVal := meta.encapsulated
 
-	// Locate the end of the ICAP headers — the first \r\n\r\n boundary.
-	// Everything after it is the encapsulated HTTP content to echo back.
-	sep := []byte("\r\n\r\n")
-	icapHdrEnd := bytes.Index(buf, sep)
-	if icapHdrEnd < 0 {
+	// Use the pre-computed header length to locate the encapsulated section.
+	// icapHdrLen already includes the trailing \r\n\r\n.
+	if meta.icapHdrLen <= 0 || meta.icapHdrLen > len(buf) {
 		// Malformed request — return a safe minimal response.
 		return []byte("ICAP/1.0 200 OK\r\nConnection: close\r\nEncapsulated: null-body=0\r\n\r\n")
 	}
-	encapsulatedSection := buf[icapHdrEnd+len(sep):]
+	encapsulatedSection := buf[meta.icapHdrLen:]
 
 	if encapsulatedVal == "" {
 		encapsulatedVal = "null-body=0"
@@ -242,7 +219,7 @@ func buildICAPEchoResponse(buf []byte) []byte {
 	// response (res-hdr + res-body/null-body) — NOT the original req-hdr.
 	// Squid treats a RESPMOD echo that includes req-hdr as malformed and closes
 	// the connection, producing ERR_ICAP_FAILURE detail=mismatch.
-	if isRespMod {
+	if meta.isRespMod {
 		encapsulatedVal, encapsulatedSection = trimReqHdrSection(encapsulatedVal, encapsulatedSection)
 	}
 
@@ -304,7 +281,7 @@ func trimReqHdrSection(encVal string, section []byte) (newEncVal string, newSect
 // handleConn reads one complete ICAP request, parses it, writes a structured
 // JSON log entry, and responds appropriately.
 // OPTIONS requests are handled immediately and never logged.
-func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
+func handleConn(conn net.Conn, logCh chan<- []byte, cfg Config) {
 	defer conn.Close()
 
 	if err := conn.SetReadDeadline(time.Now().Add(cfg.ReadTimeout)); err != nil {
@@ -312,7 +289,7 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 	}
 
 	reader := bufio.NewReaderSize(conn, 64*1024)
-	buf, err := readICAPMessage(reader, cfg.MaxBodySize)
+	buf, meta, err := readICAPMessage(reader, cfg.MaxBodySize)
 	if err != nil || len(buf) == 0 {
 		return
 	}
@@ -345,13 +322,13 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 		return
 	}
 	var icapResp []byte
-	if allow204(buf) {
+	if allow204(meta) {
 		icapResp = []byte("ICAP/1.0 204 No Modifications\r\nConnection: close\r\n\r\n")
 	} else {
-		icapResp = buildICAPEchoResponse(buf)
+		icapResp = buildICAPEchoResponse(buf, meta)
 	}
 	if _, err := conn.Write(icapResp); err != nil {
-		logger.Println(`{"error":"failed to write ICAP response"}`)
+		logCh <- []byte(`{"error":"failed to write ICAP response"}`)
 		return
 	}
 
@@ -359,7 +336,6 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 	go func() {
 		info := parseICAP(buf)
 		reqBody, respBody := selectBodies(info, cfg)
-
 		const tsFormat = "2006-01-02T15:04:05.000Z07:00"
 		entry := logEntry{
 			Timestamp:      time.Now().Format(tsFormat),
@@ -398,9 +374,9 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 			errEntry, _ := json.Marshal(map[string]string{
 				"error": fmt.Sprintf("failed to marshal log entry: %v", err),
 			})
-			logger.Println(string(errEntry))
+			logCh <- errEntry
 		} else {
-			logger.Println(string(data))
+			logCh <- data
 		}
 	}()
 }
@@ -415,19 +391,13 @@ func handleConn(conn net.Conn, logger *log.Logger, cfg Config) {
 //     only when LogReqBody is true and the parsed body is empty.
 func selectBodies(info icapInfo, cfg Config) (reqBody, respBody string) {
 	if cfg.LogReqBody {
-		reqBody = info.reqBody
-		if cfg.RedactTokens {
-			reqBody = redactTokenBody(reqBody)
-		}
+		reqBody = sanitizeBody(info.reqBody, "", "", cfg.RedactTokens)
 		if info.reqMethod == "CONNECT" && reqBody == "" {
 			reqBody = "[tunneled: HTTPS traffic, body not inspectable]"
 		}
 	}
 	if cfg.LogRespBody {
-		respBody = info.respBody
-		if cfg.RedactTokens {
-			respBody = redactTokenBody(respBody)
-		}
+		respBody = sanitizeBody(info.respBody, "", "", cfg.RedactTokens)
 	}
 	return
 }

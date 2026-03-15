@@ -5,6 +5,24 @@ import (
 	"time"
 )
 
+// icapMeta holds the lightweight metadata extracted from the ICAP request
+// headers during readICAPMessage. It is cheap to produce (no heap allocs
+// beyond the two strings) and lets allow204 / buildICAPEchoResponse avoid
+// re-scanning the buffer with a second bufio.Reader.
+type icapMeta struct {
+	// allow204 is true when the ICAP request's Allow header contains the "204" token.
+	allow204 bool
+	// isRespMod is true when the ICAP method is RESPMOD.
+	isRespMod bool
+	// encapsulated is the verbatim value of the Encapsulated header (e.g.
+	// "req-hdr=0, res-hdr=226, res-body=1244"). Empty for bare OPTIONS.
+	encapsulated string
+	// icapHdrLen is the byte length of the ICAP header section including the
+	// trailing \r\n\r\n. Used by buildICAPEchoResponse to locate the encapsulated
+	// section without a second bytes.Index scan.
+	icapHdrLen int
+}
+
 // Config holds all runtime configuration loaded from environment variables,
 // with optional CLI flag overrides (--port=, --log=, --log-rotate-size=).
 type Config struct {

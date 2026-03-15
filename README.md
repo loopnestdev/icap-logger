@@ -212,11 +212,11 @@ All settings are configurable via environment variables. CLI flags take preceden
 icap-logger/
 ├── main.go             # Entry point — main(), signal handling, server bootstrap
 ├── config.go           # Config struct, loadConfig(), getEnv(), getEnvInt()
-├── server.go           # readICAPMessage(), handleConn(), icapOptionsResponse()
+├── server.go           # readICAPMessage(), handleConn(), allow204(), buildICAPEchoResponse(), trimReqHdrSection(), selectBodies()
 ├── parser.go           # parseICAP(), splitEncapsulated(), headersToMap()
-├── logger.go           # rotatingWriter — size-based log rotation (stdlib only)
-├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked(), redactTokenBody()
-├── types.go            # Config, icapInfo, logEntry struct definitions
+├── logger.go           # rotatingWriter — size-based log rotation; startLogWriter() channel-based async writer
+├── body.go             # sanitizeBody(), isBinary(), parseMultipartBody(), decodeChunked(), sanitizeJSONBody(), redactTokenBody()
+├── types.go            # Config, icapMeta, icapInfo, logEntry struct definitions
 ├── main_test.go        # Unit tests (75 tests)
 ├── go.mod              # Go module — zero external dependencies
 ├── Dockerfile          # Multi-stage hardened Alpine build
@@ -528,13 +528,16 @@ go tool cover -html=coverage.out
 ## Notes
 
 - This server returns `204 No Modifications` only when the ICAP client advertises `Allow: 204` in the request (RFC 3507 §4.6). When `Allow: 204` is absent (e.g. when icap-logger is second in a Squid `adaptation_service_chain`), it echoes the original content with `200 OK`.
+- **RESPMOD echoes contain only the HTTP response** — `req-hdr` is stripped per RFC 3507 §4.9.2; sending it back causes `ERR_ICAP_FAILURE`
 - **Only plain text payloads are logged in full** — binary data, file uploads, and blobs are replaced with safe metadata summaries
 - **JSON bodies are content-sniffed** — Base64 field redaction applies regardless of the declared `Content-Type` (catches `application/octet-stream` uploads from AzCopy, Azure SDKs, etc.)
+- **Base64 redaction and token redaction happen in a single JSON walk** — one `json.Unmarshal / redact / json.Marshal` pass handles both, with no second parse
 - **OAuth2/OIDC tokens are redacted by default** — any JSON field whose name ends with `token` is replaced with `[redacted: token]` in both request and response bodies; disable with `REDACT_TOKENS=false`
 - `CONNECT` (HTTPS tunnel) requests are logged with `"tunneled": true`; the body is unavailable by design unless Squid SSL Bump is configured
 - Timestamps use millisecond precision in the container's local timezone (`"2026-03-02T17:02:56.123+11:00"`)
 - The ICAP `Date` header sent by Squid is intentionally omitted from `icap_headers` — it is the same moment as the top-level `timestamp` field
 - `204 No Modifications` is sent to the client **immediately** after reading the ICAP message; all parsing, sanitisation, and file I/O happens asynchronously in a goroutine so large payloads (e.g. 4 MB file uploads) never cause `ERR_ICAP_FAILURE` timeouts
+- **Log writes are non-blocking on the hot path** — goroutines send pre-serialised JSON `[]byte` to a buffered channel (capacity 512); a single dedicated writer goroutine drains it to `rotatingWriter`, eliminating the double-mutex overhead of `log.Logger`
 - Log rotation renames the active file with a timestamp suffix (e.g. `icap_logger.log.20260302-170256`) and opens a fresh file
 - Structured JSON server events go to **stdout** (suitable for container log collectors); ICAP data goes to the **rotating log file**
 - All connections are handled **concurrently** via goroutines with per-connection read/write deadlines

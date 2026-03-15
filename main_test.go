@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/base64"
 	"fmt"
@@ -16,6 +18,17 @@ import (
 
 // itoa is a test helper for int-to-string conversion.
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// parseICAPMeta is a test helper that feeds raw bytes through readICAPMessage
+// and returns the resulting icapMeta. It panics on errors other than io.EOF
+// (which is normal when reading from a fixed buffer) so test bodies stay concise.
+func parseICAPMeta(raw []byte) icapMeta {
+	_, meta, err := readICAPMessage(bufio.NewReader(bytes.NewReader(raw)), 1<<30)
+	if err != nil && err.Error() != "EOF" {
+		panic("parseICAPMeta: " + err.Error())
+	}
+	return meta
+}
 
 // buildICAP is a test helper that assembles a raw ICAP byte slice from parts.
 func buildICAP(requestLine, icapHeaders, encapsulated string) []byte {
@@ -380,7 +393,7 @@ func TestSanitizeBody_JSONBase64FieldRedacted(t *testing.T) {
 
 	body := `{"sys_id":"abc123","snow_id":"def456","last_update":1773208633000,"raw":"` + encoded + `"}`
 
-	got := sanitizeBody(body, "application/json", "")
+	got := sanitizeBody(body, "application/json", "", false)
 
 	if strings.Contains(got, encoded[:50]) {
 		t.Fatalf("Base64 payload must be redacted, got raw base64 in: %.200s", got)
@@ -396,14 +409,14 @@ func TestSanitizeBody_JSONBase64FieldRedacted(t *testing.T) {
 
 func TestSanitizeBody_JSONNonBase64Preserved(t *testing.T) {
 	body := `{"key":"value","number":42,"nested":{"a":"b"}}`
-	got := sanitizeBody(body, "application/json", "")
+	got := sanitizeBody(body, "application/json", "", false)
 	if !strings.Contains(got, "value") {
 		t.Fatalf("non-base64 JSON fields must be preserved, got: %s", got)
 	}
 }
 
 func TestSanitizeBody_JSONEmptyBody(t *testing.T) {
-	got := sanitizeBody("", "application/json", "")
+	got := sanitizeBody("", "application/json", "", false)
 	if got != "" {
 		t.Errorf("empty body should return empty, got %q", got)
 	}
@@ -417,7 +430,7 @@ func TestSanitizeBody_GzipContentEncoding(t *testing.T) {
 	// never be logged as text.
 	gzipMagic := string([]byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03}) +
 		strings.Repeat("x", 200)
-	got := sanitizeBody(gzipMagic, "application/x-git-upload-pack-request", "gzip")
+	got := sanitizeBody(gzipMagic, "application/x-git-upload-pack-request", "gzip", false)
 	if !strings.HasPrefix(got, "[binary:") {
 		t.Errorf("gzip body must be redacted, got: %q", got)
 	}
@@ -428,7 +441,7 @@ func TestSanitizeBody_GzipContentEncoding(t *testing.T) {
 
 func TestSanitizeBody_BrContentEncoding(t *testing.T) {
 	body := strings.Repeat("brotli compressed", 20)
-	got := sanitizeBody(body, "text/html", "br")
+	got := sanitizeBody(body, "text/html", "br", false)
 	if !strings.HasPrefix(got, "[binary:") {
 		t.Errorf("br-encoded body must be redacted, got: %q", got)
 	}
@@ -437,7 +450,7 @@ func TestSanitizeBody_BrContentEncoding(t *testing.T) {
 func TestSanitizeBody_MultipleEncodings(t *testing.T) {
 	// Content-Encoding can be a comma-separated list, e.g. "gzip, identity"
 	body := strings.Repeat("data", 50)
-	got := sanitizeBody(body, "application/octet-stream", "gzip, identity")
+	got := sanitizeBody(body, "application/octet-stream", "gzip, identity", false)
 	if !strings.HasPrefix(got, "[binary:") {
 		t.Errorf("multi-value content-encoding with gzip must be redacted, got: %q", got)
 	}
@@ -446,7 +459,7 @@ func TestSanitizeBody_MultipleEncodings(t *testing.T) {
 func TestSanitizeBody_NoContentEncoding(t *testing.T) {
 	// Empty/absent Content-Encoding must not suppress normal JSON parsing.
 	body := `{"key":"value"}`
-	got := sanitizeBody(body, "application/json", "")
+	got := sanitizeBody(body, "application/json", "", false)
 	if !strings.Contains(got, "value") {
 		t.Errorf("plain JSON with no content-encoding must be logged, got: %q", got)
 	}
@@ -460,7 +473,7 @@ func TestSanitizeBody_OctetStreamJSONBase64Redacted(t *testing.T) {
 
 	body := `{"name":"test.bin","raw":"` + encoded + `"}`
 
-	got := sanitizeBody(body, "application/octet-stream", "")
+	got := sanitizeBody(body, "application/octet-stream", "", false)
 
 	if strings.Contains(got, encoded[:50]) {
 		t.Fatalf("Base64 payload in octet-stream body must be redacted, got raw base64 in: %.200s", got)
@@ -479,7 +492,7 @@ func TestSanitizeBody_EmptyContentTypeJSONBase64Redacted(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("B", 600)))
 	body := `{"file":"` + encoded + `"}`
 
-	got := sanitizeBody(body, "", "")
+	got := sanitizeBody(body, "", "", false)
 
 	if strings.Contains(got, encoded[:50]) {
 		t.Fatalf("Base64 payload with empty Content-Type must be redacted, got: %.200s", got)
@@ -496,7 +509,7 @@ func TestSanitizeBody_TextPlainJSONBase64Redacted(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("C", 600)))
 	body := `{"attachment":"` + encoded + `"}`
 
-	got := sanitizeBody(body, "text/plain", "")
+	got := sanitizeBody(body, "text/plain", "", false)
 
 	if strings.Contains(got, encoded[:50]) {
 		t.Fatalf("Base64 payload with text/plain Content-Type must be redacted, got: %.200s", got)
@@ -671,7 +684,7 @@ func TestAllow204_Present(t *testing.T) {
 		"Allow: 204, trailers\r\nEncapsulated: null-body=0\r\n",
 		"",
 	)
-	if !allow204(raw) {
+	if !allow204(parseICAPMeta(raw)) {
 		t.Error("expected allow204=true when Allow header contains 204 token")
 	}
 }
@@ -683,7 +696,7 @@ func TestAllow204_Absent(t *testing.T) {
 		"Allow: trailers\r\nEncapsulated: req-body=0\r\n",
 		"",
 	)
-	if allow204(raw) {
+	if allow204(parseICAPMeta(raw)) {
 		t.Error("expected allow204=false when Allow header does not contain 204 token")
 	}
 }
@@ -695,7 +708,7 @@ func TestAllow204_NoHeader(t *testing.T) {
 		"Encapsulated: req-body=0\r\n",
 		"",
 	)
-	if allow204(raw) {
+	if allow204(parseICAPMeta(raw)) {
 		t.Error("expected allow204=false when no Allow header present")
 	}
 }
@@ -707,7 +720,7 @@ func TestAllow204_CaseInsensitive(t *testing.T) {
 		"ALLOW: 204, trailers\r\nEncapsulated: null-body=0\r\n",
 		"",
 	)
-	if !allow204(raw) {
+	if !allow204(parseICAPMeta(raw)) {
 		t.Error("expected allow204=true for ALLOW header with 204 token (case-insensitive)")
 	}
 }
@@ -719,7 +732,7 @@ func TestAllow204_NoPartialMatch(t *testing.T) {
 		"Allow: 2048, trailers\r\nEncapsulated: null-body=0\r\n",
 		"",
 	)
-	if allow204(raw) {
+	if allow204(parseICAPMeta(raw)) {
 		t.Error("expected allow204=false: '2048' must not match '204' token")
 	}
 }
@@ -736,7 +749,7 @@ func TestBuildICAPEchoResponse_ReqMod(t *testing.T) {
 		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
 		httpHdr+chunkedBody,
 	)
-	resp := buildICAPEchoResponse(raw)
+	resp := buildICAPEchoResponse(raw, parseICAPMeta(raw))
 	respStr := string(resp)
 
 	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
@@ -761,7 +774,7 @@ func TestBuildICAPEchoResponse_NullBody(t *testing.T) {
 		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
 		httpHdr,
 	)
-	resp := buildICAPEchoResponse(raw)
+	resp := buildICAPEchoResponse(raw, parseICAPMeta(raw))
 	respStr := string(resp)
 
 	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
@@ -777,7 +790,8 @@ func TestBuildICAPEchoResponse_NullBody(t *testing.T) {
 
 func TestBuildICAPEchoResponse_Malformed(t *testing.T) {
 	// No \r\n\r\n boundary — must return a safe fallback response, not panic.
-	resp := buildICAPEchoResponse([]byte("REQMOD icap://localhost ICAP/1.0\r\nAllow: trailers"))
+	raw := []byte("REQMOD icap://localhost ICAP/1.0\r\nAllow: trailers")
+	resp := buildICAPEchoResponse(raw, parseICAPMeta(raw))
 	if !strings.HasPrefix(string(resp), "ICAP/1.0 200 OK") {
 		t.Errorf("malformed input must return a safe 200 OK response, got: %q", resp)
 	}
@@ -798,7 +812,7 @@ func TestBuildICAPEchoResponse_RespMod(t *testing.T) {
 		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
 		reqHdr+resHdr+chunkedBody,
 	)
-	resp := buildICAPEchoResponse(raw)
+	resp := buildICAPEchoResponse(raw, parseICAPMeta(raw))
 	respStr := string(resp)
 
 	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
@@ -835,7 +849,7 @@ func TestBuildICAPEchoResponse_RespMod_NullBody(t *testing.T) {
 		"Allow: trailers\r\nEncapsulated: "+encHeader+"\r\n",
 		reqHdr+resHdr,
 	)
-	resp := buildICAPEchoResponse(raw)
+	resp := buildICAPEchoResponse(raw, parseICAPMeta(raw))
 	respStr := string(resp)
 
 	if !strings.HasPrefix(respStr, "ICAP/1.0 200 OK\r\n") {
